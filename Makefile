@@ -4,7 +4,8 @@
 	smoke-markdiffusion bootstrap-markdiffusion docker-markdiffusion-build docker-markdiffusion-help \
 	bench-synthid-text \
 	docker-core-build docker-core-help serve compose-up compose-up-heavy compose-check \
-	install-skill install-cursor-text-skill clean
+	install-skill install-cursor-text-skill install-global-hooks uninstall-global-hooks \
+	install-omp-extension clean
 
 SCRIPTS := service/scripts
 PYTHON ?= $(shell if [ -x .venv/bin/python ]; then echo .venv/bin/python; else echo python3; fi)
@@ -127,6 +128,15 @@ install-skill:
 
 install-cursor-text-skill:
 	$(PYTHON) install_skill.py
+
+install-global-hooks:
+	./service/scripts/install_global_hooks.sh
+
+uninstall-global-hooks:
+	./service/scripts/uninstall_global_hooks.sh
+
+install-omp-extension:
+	./integrations/omp/install.sh
 
 clean:
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true

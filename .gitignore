@@ -8,6 +8,8 @@
 !/benchmarks/**
 !/docs/
 !/docs/**
+!/integrations/
+!/integrations/**
 !/service/
 !/service/**
 !/skills/remove-ai-marks/

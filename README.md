@@ -913,6 +913,49 @@ repos:
 
 `watermarks-remover-check` fails the commit and lists findings; `watermarks-remover-clean` is opt-in and rewrites staged files in place (exits 1 so you review the diff and re-stage — the same convention as auto-fixing hooks like `ruff --fix`). When the cleaner cannot process a file at all — it crashed, was killed, or produced no report — `watermarks-remover-clean` names that file and exits 3 instead, so a cleaner that failed is never mistaken for an already-clean file. Run either by hand with `python3 service/scripts/check_staged.py <files...>` / `clean_staged.py <files...>`.
 
+## Global git hooks (every repo, no per-repo config)
+
+The section above opts one repo in via the [pre-commit](https://pre-commit.com/) framework. `service/scripts/install_global_hooks.sh` instead installs a **machine-wide** pre-commit hook via `git config --global core.hooksPath`, so every repo you commit to is scanned — no `.pre-commit-config.yaml` needed anywhere:
+
+```bash
+./service/scripts/install_global_hooks.sh      # detect-only by default
+./service/scripts/uninstall_global_hooks.sh    # reverse it
+```
+
+It wraps `check_staged.py` / `clean_staged.py` exactly like the pre-commit hooks above; the installer just wires them into `git config --global core.hooksPath` instead of a per-repo framework. If that hooks directory already has a `pre-commit` script (from `git-scoped-coauthor-trailer`'s gitleaks hook, husky, lefthook, ...), the installer preserves it as `pre-commit.pre-watermarks-remover` and chains to it after the watermarks-remover check runs, so nothing else you rely on silently stops firing.
+
+Per-repo and per-commit overrides:
+
+```bash
+git config watermarks-remover.mode clean       # this repo: auto-clean instead of block
+git config watermarks-remover.enabled false    # this repo: skip entirely
+WATERMARKS_REMOVER_DISABLE=1 git commit ...     # this commit only: skip
+WATERMARKS_REMOVER_MODE=clean git commit ...    # this commit only: auto-clean
+```
+
+`git config --global watermarks-remover.mode clean` flips the default to auto-clean everywhere. The installer records the checkout location in `~/.config/watermarks-remover/global-hooks.conf` (`WATERMARKS_REMOVER_HOME`); both the hook and the `/remove-watermarks` omp command below read it to find `service/scripts/`.
+
+## `/remove-watermarks` omp command
+
+The [`integrations/omp/`](integrations/omp/) directory ships an [omp](https://github.com/badlogic/oh-my-pi) extension that adds a `/remove-watermarks` slash command to the agent:
+
+```bash
+./integrations/omp/install.sh   # symlinks the extension into ~/.omp/agent/extensions
+```
+
+Restart omp (or `/reload-plugins`), then in any session:
+
+```
+/remove-watermarks [path] [--check-only] [--stylometry]
+```
+
+- `path` defaults to the current directory.
+- Default mode scans with `audit_dir.py`, cleans every actionable file with `clean_file.py --in-place` (writing `.bak` backups, same as the CLI), then re-scans to confirm residual findings.
+- `--check-only` (alias `--dry-run` / `--detect-only`) only scans; nothing is written.
+- `--stylometry` also runs the statistical/stylometric text checks (`--check-stylometry`).
+
+Either way the command hands its results to the agent as a follow-up turn instead of trusting its own subprocess output silently: for a clean run it asks the agent to diff each changed file against its `.bak`, confirm the residual-findings count is actually zero, and flag anything that looks like collateral damage; for `--check-only` it asks the agent to verify the findings and decide what (if anything) to clean. It needs the same `WATERMARKS_REMOVER_HOME` config as the global git hook — run `install_global_hooks.sh` once, or export `WATERMARKS_REMOVER_HOME` yourself.
+
 ## Tests
 
 ```bash

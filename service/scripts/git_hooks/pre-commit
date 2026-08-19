@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# watermarks-remover-global-hook
+#
+# Global pre-commit hook: scans (and optionally cleans) staged files in
+# *any* git repo for AI/C2PA provenance marks before they are committed.
+#
+# Installed by service/scripts/install_global_hooks.sh via
+# `git config --global core.hooksPath`, so this single file runs for every
+# repo on the machine unless a repo opts out (see below). It wraps the
+# existing check_staged.py / clean_staged.py CLIs — no detection or removal
+# logic is duplicated here.
+#
+# Config, cheapest to slowest to override:
+#   git config --global watermarks-remover.enabled false   # opt out everywhere
+#   git config watermarks-remover.enabled false             # opt out one repo
+#   git config watermarks-remover.mode clean                 # auto-clean one repo
+#   WATERMARKS_REMOVER_MODE=clean git commit ...              # auto-clean once
+#   WATERMARKS_REMOVER_DISABLE=1 git commit ...                # skip once
+#
+# If a pre-commit script already occupied this hooksPath directory before
+# install (e.g. from another tool), the installer backed it up next to this
+# file as `pre-commit.pre-watermarks-remover` and we chain to it below so
+# nothing already relying on core.hooksPath silently stops running.
+set -u
+
+CONFIG_FILE="${WATERMARKS_REMOVER_GLOBAL_CONFIG:-$HOME/.config/watermarks-remover/global-hooks.conf}"
+if [ -f "$CONFIG_FILE" ]; then
+  # shellcheck source=/dev/null
+  . "$CONFIG_FILE"
+fi
+
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+CHAINED_HOOK="$HOOK_DIR/pre-commit.pre-watermarks-remover"
+
+chain() {
+  if [ -x "$CHAINED_HOOK" ]; then
+    "$CHAINED_HOOK" "$@"
+    exit $?
+  fi
+  exit 0
+}
+
+# Not inside a git worktree at all (defensive; git normally guarantees this).
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || chain "$@"
+
+if [ "$(git config --get watermarks-remover.enabled 2>/dev/null)" = "false" ]; then
+  chain "$@"
+fi
+if [ -n "${WATERMARKS_REMOVER_DISABLE:-}" ]; then
+  chain "$@"
+fi
+
+if [ -z "${WATERMARKS_REMOVER_HOME:-}" ] || [ ! -f "$WATERMARKS_REMOVER_HOME/service/scripts/check_staged.py" ]; then
+  echo "watermarks-remover: global hook installed but WATERMARKS_REMOVER_HOME is not set to a valid checkout (config: $CONFIG_FILE) — skipping. Re-run install_global_hooks.sh." >&2
+  chain "$@"
+fi
+
+PYTHON_BIN="${WATERMARKS_REMOVER_PYTHON:-python3}"
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+  echo "watermarks-remover: '$PYTHON_BIN' not found on PATH — skipping check." >&2
+  chain "$@"
+fi
+
+SCRIPTS="$WATERMARKS_REMOVER_HOME/service/scripts"
+
+MODE="$(git config --get watermarks-remover.mode 2>/dev/null || true)"
+MODE="${MODE:-${WATERMARKS_REMOVER_MODE:-check}}"
+
+mapfile -t staged_files < <(git diff --cached --name-only --diff-filter=ACM)
+existing=()
+for f in "${staged_files[@]:-}"; do
+  [ -n "$f" ] && [ -f "$f" ] && existing+=("$f")
+done
+
+if [ "${#existing[@]}" -eq 0 ]; then
+  chain "$@"
+fi
+
+if [ "$MODE" = "clean" ]; then
+  "$PYTHON_BIN" "$SCRIPTS/clean_staged.py" "${existing[@]}"
+  status=$?
+  if [ "$status" -eq 1 ]; then
+    echo "watermarks-remover: staged files were cleaned in place (mode=clean) — review the diff and 'git add' before committing again." >&2
+    exit 1
+  elif [ "$status" -ne 0 ]; then
+    echo "watermarks-remover: clean_staged.py failed (exit $status) — blocking commit." >&2
+    exit 1
+  fi
+else
+  if ! "$PYTHON_BIN" "$SCRIPTS/check_staged.py" "${existing[@]}"; then
+    echo "watermarks-remover: blocking commit (mode=check)." >&2
+    echo "  auto-clean this repo:  git config watermarks-remover.mode clean" >&2
+    echo "  skip this repo:        git config watermarks-remover.enabled false" >&2
+    echo "  skip this commit only: WATERMARKS_REMOVER_DISABLE=1 git commit ..." >&2
+    exit 1
+  fi
+fi
+
+chain "$@"
