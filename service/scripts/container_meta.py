@@ -105,6 +105,26 @@ AI_META_NAME_RE = re.compile(
     re.I,
 )
 
+# A genuine "generator"/"software"/"tool" metadata value is a short tag
+# ("ChatGPT", "Adobe Firefly 2"), not free-form prose. Scanning every
+# frontmatter value for a bare vendor-name substring makes any long
+# descriptive field (e.g. a `description:` sentence that merely *talks
+# about* "Claude" or "Gemini" as subject matter, such as documentation for
+# AI-tool config files) a false positive — and the cleaner then deletes the
+# whole key. Cap the value-hit check to short, tag-like values so it only
+# fires on values that plausibly *are* a generator name, not prose that
+# mentions one.
+_PROVENANCE_VALUE_WORD_LIMIT = 6
+
+
+def _is_provenance_tag_value(val: str) -> bool:
+    stripped = val.strip().strip("\"'")
+    if not stripped:
+        return False
+    if len(stripped.split()) > _PROVENANCE_VALUE_WORD_LIMIT:
+        return False
+    return bool(AI_META_NAME_RE.search(stripped))
+
 SVG_DROP_TAGS = frozenset(
     {
         "{http://www.w3.org/2000/svg}metadata",
@@ -443,7 +463,7 @@ def inspect_markdown(text: str) -> tuple[bool, bool, list[str], dict]:
                 findings.append(f"frontmatter key: {key}")
             # also check value
             val = _line.split(":", 1)[1] if ":" in _line else ""
-            if AI_META_NAME_RE.search(val):
+            if _is_provenance_tag_value(val):
                 has_ai = True
                 findings.append(f"frontmatter value hit on {key}")
 
@@ -493,7 +513,7 @@ def clean_markdown(text: str) -> tuple[str, list[str]]:
                 actions.append(f"drop frontmatter key: {key}")
                 dropping = True
                 continue
-            if AI_META_NAME_RE.search(val):
+            if _is_provenance_tag_value(val):
                 actions.append(f"drop frontmatter key (value hit): {key}")
                 dropping = True
                 continue

@@ -40,6 +40,15 @@ def _changed(result: dict) -> bool:
     stats = result.get("stats")
     if stats is not None:
         return bool(stats.get("removed_count") or stats.get("replaced_count"))
+    bytes_in = result.get("bytes_in")
+    bytes_out = result.get("bytes_out")
+    if bytes_in is not None and bytes_out is not None:
+        # image/av/container reports always carry a non-empty `actions` log
+        # (including a "no X removed" placeholder when nothing happened), so
+        # `bool(actions)` is never a reliable no-op signal for these kinds —
+        # it reported every already-clean file as "changed" forever. Byte
+        # length is the actual ground truth for whether anything was written.
+        return bytes_in != bytes_out
     return bool(result.get("actions"))
 
 
