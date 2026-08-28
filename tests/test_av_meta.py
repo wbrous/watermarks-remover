@@ -15,6 +15,7 @@ from av_meta import (
     detect_av_format,
     inspect_av,
 )
+from image_meta import _contains_c2pa_prov_box
 
 # ---------------------------------------------------------------------------
 # Fixture builders
@@ -41,6 +42,8 @@ def _moov_with_udta(udta_payload: bytes) -> bytes:
 
 
 XMP_UUID_HEX = bytes.fromhex("be7acfcb97a942e89c71999491e3afac")
+# C2PA ContentProvenanceBox user type for BMFF containers (MP4/MOV/HEIF/AVIF).
+C2PA_BMFF_UUID = bytes.fromhex("d8fec3d61b0e483c92975828877ec481")
 
 
 def _mp4_with_xmp(xmp_text: bytes) -> bytes:
@@ -55,6 +58,14 @@ def _mp4_with_udta_tag(tag_text: bytes) -> bytes:
     )
     mdat = _isobmff_box(b"mdat", b"\x00" * 16)
     return _mp4(moov, mdat)
+
+
+def _mp4_with_c2pa_manifest(purpose: bytes = b"manifest", data: bytes | None = None) -> bytes:
+    if data is None:
+        data = b"c2pa" + b"\x00" * 8 + b"jumb" + b"\x00" * 4  # fake JUMBF-ish store
+    c2pa_box = _isobmff_box(b"uuid", C2PA_BMFF_UUID + purpose + b"\x00" + data)
+    mdat = _isobmff_box(b"mdat", b"\x00" * 16)
+    return _mp4(c2pa_box, mdat)
 
 
 def _riff_chunk(cid: bytes, payload: bytes) -> bytes:
@@ -84,9 +95,11 @@ def _id3v2_size_bytes(n: int) -> bytes:
     return bytes([(n >> 21) & 0x7F, (n >> 14) & 0x7F, (n >> 7) & 0x7F, n & 0x7F])
 
 
-def _id3v2_frame(frame_id: bytes, payload: bytes, *, major: int = 3) -> bytes:
+def _id3v2_frame(
+    frame_id: bytes, payload: bytes, *, major: int = 3, flags: bytes = b"\x00\x00"
+) -> bytes:
     size = _id3v2_size_bytes(len(payload)) if major == 4 else struct.pack(">I", len(payload))
-    return frame_id + size + b"\x00\x00" + payload
+    return frame_id + size + flags + payload
 
 
 def _mp3(*frames: bytes, major: int = 3) -> bytes:
@@ -94,6 +107,22 @@ def _mp3(*frames: bytes, major: int = 3) -> bytes:
     header = b"ID3" + bytes([major, 0, 0]) + _id3v2_size_bytes(len(body))
     audio = bytes([0xFF, 0xFB, 0x90, 0x00]) * 4  # placeholder MPEG frame-sync bytes
     return header + body + audio
+
+
+def _flac(
+    *frames: bytes, major: int = 3, extended_header: bytes = b"", footer: bool = False
+) -> bytes:
+    body = extended_header + b"".join(frames)
+    flags = (0x40 if extended_header else 0) | (0x10 if footer else 0)
+    size = _id3v2_size_bytes(len(body))
+    id3_footer = b"3DI" + bytes([major, 0, flags]) + size if footer else b""
+    id3 = b"ID3" + bytes([major, 0, flags]) + size + body + id3_footer if body else b""
+    streaminfo = b"\x80\x00\x00\x22" + b"\x00" * 34
+    return id3 + b"fLaC" + streaminfo
+
+
+def _c2pa_geob() -> bytes:
+    return b"\x00application/c2pa\x00manifest.c2pa\x00Content Credentials\x00jumbf-data"
 
 
 # ---------------------------------------------------------------------------
@@ -118,8 +147,197 @@ def test_detect_mp3_frame_sync_only():
     assert detect_av_format(data) == "mp3"
 
 
+def test_detect_flac_with_or_without_id3():
+    assert detect_av_format(_flac()) == "flac"
+    assert detect_av_format(_flac(_id3v2_frame(b"TIT2", b"\x00My Track"))) == "flac"
+
+
 def test_detect_unknown():
     assert detect_av_format(b"not a known av container") == "unknown"
+
+
+def test_flac_c2pa_geob_detected(tmp_path):
+    data = _flac(_id3v2_frame(b"GEOB", _c2pa_geob()))
+    src = tmp_path / "voice.flac"
+    src.write_bytes(data)
+
+    report = inspect_av(src)
+    assert report.format == "flac"
+    assert report.has_c2pa is True
+    assert report.has_ai_metadata is True
+    assert any("GEOB" in finding for finding in report.findings)
+    assert report.to_dict()["findings_confidence"] == ["confirmed"]
+
+
+def test_flac_keep_mode_drops_c2pa_geob_and_preserves_audio_and_title(tmp_path):
+    flac_payload = _flac()
+    data = _flac(
+        _id3v2_frame(b"TIT2", b"\x00My Track"),
+        _id3v2_frame(b"GEOB", _c2pa_geob()),
+    )
+    src = tmp_path / "voice.flac"
+    src.write_bytes(data)
+    dest = tmp_path / "voice.cleaned.flac"
+
+    result = clean_av(src, dest, strip_all_metadata=False)
+
+    cleaned = dest.read_bytes()
+    assert result["format"] == "flac"
+    assert result["still_has_c2pa"] is False
+    assert b"My Track" in cleaned
+    assert b"application/c2pa" not in cleaned
+    assert cleaned.endswith(flac_payload)
+    assert any("GEOB" in action for action in result["actions"])
+
+
+def test_flac_keep_mode_drops_empty_id3_tag(tmp_path):
+    flac_payload = _flac()
+    src = tmp_path / "voice.flac"
+    src.write_bytes(_flac(_id3v2_frame(b"GEOB", _c2pa_geob())))
+    dest = tmp_path / "voice.cleaned.flac"
+
+    clean_av(src, dest, strip_all_metadata=False)
+
+    assert dest.read_bytes() == flac_payload
+
+
+def test_flac_keep_mode_preserves_retained_frame_bytes(tmp_path):
+    title_frame = _id3v2_frame(b"TIT2", b"\x00My Track", major=4, flags=b"\x20\x00")
+    src = tmp_path / "voice.flac"
+    src.write_bytes(_flac(title_frame, _id3v2_frame(b"GEOB", _c2pa_geob(), major=4), major=4))
+    dest = tmp_path / "voice.cleaned.flac"
+
+    clean_av(src, dest, strip_all_metadata=False)
+
+    assert title_frame in dest.read_bytes()
+
+
+def test_flac_c2pa_geob_after_id3_extended_header(tmp_path):
+    v23_extended = struct.pack(">I", 10) + b"\x80\x00" + struct.pack(">I", 0) + b"\x00" * 4
+    v24_extended = _id3v2_size_bytes(6) + b"\x01\x00"
+    flac_payload = _flac()
+
+    for major, extended_header in ((3, v23_extended), (4, v24_extended)):
+        title_frame = _id3v2_frame(b"TIT2", b"\x00My Track", major=major)
+        src = tmp_path / f"voice-v24-{major}.flac"
+        src.write_bytes(
+            _flac(
+                title_frame,
+                _id3v2_frame(b"GEOB", _c2pa_geob(), major=major),
+                major=major,
+                extended_header=extended_header,
+            )
+        )
+
+        report = inspect_av(src)
+        assert report.has_c2pa is True
+
+        dest = tmp_path / f"voice-v24-{major}.cleaned.flac"
+        clean_av(src, dest, strip_all_metadata=False)
+        cleaned = dest.read_bytes()
+        assert b"application/c2pa" not in cleaned
+        assert title_frame in cleaned
+        assert cleaned.endswith(flac_payload)
+        assert cleaned[5] & 0x40 == 0
+
+
+def test_flac_c2pa_geob_before_id3v24_footer(tmp_path):
+    title_frame = _id3v2_frame(b"TIT2", b"\x00My Track", major=4)
+    src = tmp_path / "voice.flac"
+    src.write_bytes(
+        _flac(
+            title_frame,
+            _id3v2_frame(b"GEOB", _c2pa_geob(), major=4),
+            major=4,
+            footer=True,
+        )
+    )
+
+    report = inspect_av(src)
+    assert report.format == "flac"
+    assert report.has_c2pa is True
+
+    dest = tmp_path / "voice.cleaned.flac"
+    clean_av(src, dest, strip_all_metadata=False)
+    cleaned = dest.read_bytes()
+    assert detect_av_format(cleaned) == "flac"
+    assert title_frame in cleaned
+    assert b"application/c2pa" not in cleaned
+    assert b"3DI" not in cleaned
+    assert cleaned[5] & 0x10 == 0
+    assert cleaned.endswith(_flac())
+
+
+def test_flac_ignores_non_geob_ai_text(tmp_path):
+    data = _flac(_id3v2_frame(b"COMM", b"\x00Generated by AI"))
+    src = tmp_path / "voice.flac"
+    src.write_bytes(data)
+
+    report = inspect_av(src)
+    assert report.has_c2pa is False
+    assert report.has_ai_metadata is False
+
+    dest = tmp_path / "voice.cleaned.flac"
+    clean_av(src, dest, strip_all_metadata=False)
+    assert dest.read_bytes() == data
+
+
+def test_flac_ignores_truncated_c2pa_geob(tmp_path):
+    data = _flac(_id3v2_frame(b"GEOB", b"\x00application/c2pa\x00"))
+    src = tmp_path / "voice.flac"
+    src.write_bytes(data)
+
+    report = inspect_av(src)
+    assert report.has_c2pa is False
+    assert report.has_ai_metadata is False
+
+    dest = tmp_path / "voice.cleaned.flac"
+    clean_av(src, dest, strip_all_metadata=False)
+    assert dest.read_bytes() == data
+
+
+def test_flac_keep_mode_preserves_tag_with_truncated_frame(tmp_path):
+    truncated_title = b"TIT2" + struct.pack(">I", 20) + b"\x00\x00partial"
+    data = _flac(
+        _id3v2_frame(b"GEOB", _c2pa_geob()),
+        truncated_title,
+    )
+    src = tmp_path / "voice.flac"
+    src.write_bytes(data)
+    dest = tmp_path / "voice.cleaned.flac"
+
+    clean_av(src, dest, strip_all_metadata=False)
+
+    assert dest.read_bytes() == data
+
+
+def test_flac_keep_mode_preserves_tag_with_nonzero_short_tail(tmp_path):
+    data = _flac(
+        _id3v2_frame(b"GEOB", _c2pa_geob()),
+        b"TIT2bad",
+    )
+    src = tmp_path / "voice.flac"
+    src.write_bytes(data)
+    dest = tmp_path / "voice.cleaned.flac"
+
+    clean_av(src, dest, strip_all_metadata=False)
+
+    assert dest.read_bytes() == data
+
+
+def test_flac_keep_mode_accepts_zero_padding(tmp_path):
+    src = tmp_path / "voice.flac"
+    src.write_bytes(
+        _flac(
+            _id3v2_frame(b"GEOB", _c2pa_geob()),
+            b"\x00" * 7,
+        )
+    )
+    dest = tmp_path / "voice.cleaned.flac"
+
+    clean_av(src, dest, strip_all_metadata=False)
+
+    assert dest.read_bytes() == _flac()
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +437,41 @@ def test_mp4_udta_stripped_by_default_even_without_ai_hint(tmp_path):
     assert any("udta" in a for a in result["actions"])
 
 
+def test_mp4_truncated_tail_survives_udta_stripping(tmp_path):
+    moov = _moov_with_udta(b"    toolGenerated by OpenAI Sora")
+    mdat = _isobmff_box(b"mdat", b"\x00" * 4096)
+    whole = _mp4(moov, mdat)
+    mdat_start = whole.index(mdat)
+    data = whole[:-1024]
+    src = tmp_path / "truncated.mp4"
+    src.write_bytes(data)
+    dest = tmp_path / "truncated.cleaned.mp4"
+
+    result = clean_av(src, dest, strip_all_metadata=True)
+
+    cleaned = dest.read_bytes()
+    assert len(cleaned) == len(data)
+    assert cleaned[mdat_start:] == data[mdat_start:]
+    assert b"Generated by OpenAI Sora" not in cleaned
+    assert any("truncated tail" in action for action in result["actions"])
+    assert result["still_has_ai_metadata"] is True
+    assert any("not fully inspected" in finding for finding in result["post_findings"])
+
+
+def test_mp4_truncated_metadata_box_is_reported_as_inconclusive(tmp_path):
+    moov = _moov_with_udta(b"    toolGenerated by OpenAI Sora" + b"\x00" * 32)
+    data = _mp4(moov)[:-16]
+    src = tmp_path / "truncated-metadata.mp4"
+    src.write_bytes(data)
+    dest = tmp_path / "truncated-metadata.cleaned.mp4"
+
+    result = clean_av(src, dest, strip_all_metadata=True)
+
+    assert dest.read_bytes() == data
+    assert result["still_has_ai_metadata"] is True
+    assert any("not fully inspected" in finding for finding in result["post_findings"])
+
+
 def test_mp4_keep_non_ai_metadata_preserves_unflagged_udta(tmp_path):
     data = _mp4_with_udta_tag(b"Adobe Premiere Pro 2026")
     src = tmp_path / "clip.mp4"
@@ -237,6 +490,130 @@ def test_mp4_clean_file_is_idempotent_when_already_clean(tmp_path):
     result = clean_av(src, dest, strip_all_metadata=True)
     assert result["still_has_ai_metadata"] is False
     assert result["still_has_c2pa"] is False
+
+
+def test_mp4_c2pa_manifest_uuid_detected_and_stripped(tmp_path):
+    data = _mp4_with_c2pa_manifest()
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(data)
+
+    report = inspect_av(src)
+    assert report.format == "mp4"
+    assert report.has_c2pa is True
+    assert report.has_ai_metadata is True
+    assert any("content-provenance" in f for f in report.findings)
+
+    dest = tmp_path / "clip.cleaned.mp4"
+    result = clean_av(src, dest, strip_all_metadata=True)
+    cleaned = dest.read_bytes()
+    assert result["still_has_c2pa"] is False
+    assert C2PA_BMFF_UUID not in cleaned
+    assert any("content-provenance" in a for a in result["actions"])
+
+
+def test_mp4_c2pa_manifest_stripped_in_keep_mode_by_user_type(tmp_path):
+    # Manifest data with NO ASCII 'c2pa'/'jumb' marker: the old substring scan
+    # would miss it in keep-mode, so this proves the C2PA user type alone now
+    # drives detection and removal.
+    data = _mp4_with_c2pa_manifest(data=bytes(range(1, 64)))
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(data)
+
+    report = inspect_av(src)
+    assert report.has_c2pa is True
+
+    dest = tmp_path / "clip.cleaned.mp4"
+    result = clean_av(src, dest, strip_all_metadata=False)
+    assert result["still_has_c2pa"] is False
+    assert C2PA_BMFF_UUID not in dest.read_bytes()
+    assert any("content-provenance" in a for a in result["actions"])
+
+
+def test_mp4_c2pa_manifest_preserves_mdat_offset(tmp_path):
+    data = _mp4_with_c2pa_manifest()
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(data)
+    dest = tmp_path / "clip.cleaned.mp4"
+
+    clean_av(src, dest, strip_all_metadata=True)
+
+    cleaned = dest.read_bytes()
+    assert cleaned.index(b"mdat") == data.index(b"mdat")
+    assert C2PA_BMFF_UUID not in cleaned
+    assert b"free" in cleaned  # replaced with an equal-size free box, offsets intact
+
+
+def test_mp4_c2pa_update_manifest_appended_stripped(tmp_path):
+    # Update manifests are appended as the last box with box_purpose "update".
+    data = _mp4(
+        _isobmff_box(b"mdat", b"\x00" * 16),
+        _isobmff_box(b"uuid", C2PA_BMFF_UUID + b"update\x00" + bytes(range(1, 32))),
+    )
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(data)
+
+    report = inspect_av(src)
+    assert report.has_c2pa is True
+
+    dest = tmp_path / "clip.cleaned.mp4"
+    result = clean_av(src, dest, strip_all_metadata=False)
+    assert result["still_has_c2pa"] is False
+    assert C2PA_BMFF_UUID not in dest.read_bytes()
+
+
+def test_mp4_c2pa_merkle_aux_box_detected_by_user_type(tmp_path):
+    # A "merkle" auxiliary box holds only binary Merkle data (no ASCII marker),
+    # so recognition must come from the C2PA user type, not a substring scan.
+    data = _mp4_with_c2pa_manifest(purpose=b"merkle", data=bytes(range(1, 128)))
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(data)
+
+    report = inspect_av(src)
+    assert report.has_c2pa is True
+    assert any("content-provenance" in f for f in report.findings)
+
+
+def test_mp4_uuid_box_with_c2pa_bytes_at_invalid_offset_not_treated_as_manifest(tmp_path):
+    # A non-C2PA uuid box whose payload happens to hold the C2PA UUID at an
+    # invalid offset (1) must not be classified as a C2PA manifest box, and must
+    # survive a keep-mode clean (the old `uuid in payload[:20]` matched here).
+    bad_box = _isobmff_box(b"uuid", b"\x00" + C2PA_BMFF_UUID + b"not-a-manifest")
+    data = _mp4(bad_box, _isobmff_box(b"mdat", b"\x00" * 16))
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(data)
+
+    report = inspect_av(src)
+    assert report.has_c2pa is False
+
+    dest = tmp_path / "clip.cleaned.mp4"
+    result = clean_av(src, dest, strip_all_metadata=False)
+    assert C2PA_BMFF_UUID in dest.read_bytes()  # preserved in keep-mode
+    assert not any("content-provenance" in a for a in result["actions"])
+
+
+def test_mp4_c2pa_manifest_uuid_at_offset_4_still_detected(tmp_path):
+    # Accept the defensive FullBox layout (version/flags before the user type):
+    # the UUID is at payload offset 4 and must still be recognized.
+    data = _mp4(
+        _isobmff_box(b"uuid", b"\x00\x00\x00\x00" + C2PA_BMFF_UUID + b"manifest\x00" + b"data"),
+        _isobmff_box(b"mdat", b"\x00" * 16),
+    )
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(data)
+
+    report = inspect_av(src)
+    assert report.has_c2pa is True
+
+    dest = tmp_path / "clip.cleaned.mp4"
+    result = clean_av(src, dest, strip_all_metadata=False)
+    assert result["still_has_c2pa"] is False
+
+
+def test_c2pa_prov_box_scan_requires_uuid_fourcc():
+    # The whole-file fallback must only report C2PA when the UUID follows a
+    # `uuid` fourcc, not for a UUID-like byte sequence elsewhere (e.g. in mdat).
+    assert _contains_c2pa_prov_box(b"\x00" * 8 + b"uuid" + C2PA_BMFF_UUID + b"rest") is True
+    assert _contains_c2pa_prov_box(b"\x00" * 10 + C2PA_BMFF_UUID + b"\x00" * 10) is False
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +636,28 @@ def test_wav_list_info_ai_hint_detected_and_stripped(tmp_path):
     cleaned = dest.read_bytes()
     assert b"Generated by AI" not in cleaned
     assert result["still_has_ai_metadata"] is False
+
+
+def test_wav_c2pa_chunk_detected_and_stripped(tmp_path):
+    manifest = b"C2PA manifest store"
+    fmt_chunk = _wav_fmt_chunk()
+    data_chunk = _wav_data_chunk(8)
+    data = _wav(fmt_chunk, _riff_chunk(b"C2PA", manifest), data_chunk)
+    src = tmp_path / "voice.wav"
+    src.write_bytes(data)
+
+    report = inspect_av(src)
+    assert report.has_c2pa is True
+    assert any("C2PA" in f for f in report.findings)
+
+    dest = tmp_path / "voice.cleaned.wav"
+    result = clean_av(src, dest, strip_all_metadata=False)
+    cleaned = dest.read_bytes()
+    assert result["actions"] == ["drop WAV C2PA chunk"]
+    assert cleaned == _wav(fmt_chunk, data_chunk)
+    assert b"C2PA" not in cleaned
+    assert manifest not in cleaned
+    assert result["still_has_c2pa"] is False
 
 
 def test_wav_audio_data_untouched(tmp_path):

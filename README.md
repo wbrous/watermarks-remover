@@ -19,11 +19,11 @@ Agent skill + stdlib Python service to strip **multi-vendor AI provenance marks*
 | --- | --- | --- |
 | **A** | Invisible Unicode, exotic spaces, bidi, tag chars | Deterministic Python scripts |
 | **B** | Statistical (token-sampling) text watermarks | Agent rewrite + optional `rewrite_text.py` hook |
-| **Files** | C2PA / EXIF / XMP / doc props | PNG, JPEG, WebP, AVIF, HEIC, BMP, GIF, TIFF, SVG, PDF, DOCX, XLSX, PPTX, EPUB, ODT, HTML, Markdown, MP4/MOV/M4A/M4V, WAV, MP3 |
+| **Files** | C2PA / EXIF / XMP / doc props | PNG, JPEG, WebP, AVIF, HEIC, BMP, GIF, TIFF, SVG, PDF, DOCX, XLSX, PPTX, EPUB, ODT, HTML, Markdown, MP4/MOV/M4A/M4V, WAV, MP3, FLAC |
 
 Vendors / ecosystems (class-level): **Claude**, **Gemini / SynthID-Text**, **OpenAI** provenance surfaces, **open-LLM** Kirchenbauer-style (green-list) and keyed-Gumbel / EXP (Aaronson) marks.
 
-**Latest release:** [v0.5.0](https://github.com/guillaumemeyer/watermarks-remover/releases/tag/v0.5.0)
+**Latest release:** [v0.6.0](https://github.com/guillaumemeyer/watermarks-remover/releases/tag/v0.6.0)
 
 Skill path: [`skills/remove-ai-marks/`](skills/remove-ai-marks/)  
 Service path: [`service/`](service/)  
@@ -32,6 +32,174 @@ Service path: [`service/`](service/)
 ## Install (agent skill)
 
 The skill ships **no code** — it calls the service over HTTP. Install the skill (markdown only) and start the service, then set `WATERMARKS_SERVICE_URL` if it is not `http://127.0.0.1:8765`.
+
+In Claude Code, the fastest route is the bundled
+[plugin marketplace](#claude-code-plugin-marketplace) — no clone, and it updates
+in place. Everywhere else, one installer covers every supported host
+(Python 3.10+ stdlib, no dependencies):
+
+```bash
+python3 install_skill.py --skill remove-ai-marks --target claude-code
+```
+
+| Host | Target | Lands in |
+| --- | --- | --- |
+| Claude Code (personal) | `--target claude-code` | `~/.claude/skills/<skill>` (honors `CLAUDE_CONFIG_DIR`) |
+| Claude Code (project) | `--target claude-project --project-dir PATH` | `PATH/.claude/skills/<skill>` |
+| Cowork, claude.ai, cloud sessions, routines | `--target cowork` | `dist/<skill>.zip` to upload under **Customize → Skills** |
+| Cursor | `--target cursor` (default) | `~/.cursor/skills/<skill>` |
+
+Shipped skills: `remove-ai-marks` (full, service-backed) and
+`clean-user-facing-text` (text only, self-contained). `--list` prints them.
+Existing installations are preserved unless you pass `--force`; replacement is
+staged first and the previous install is kept as a uniquely named backup.
+`--link` symlinks this checkout instead of copying, so edits are picked up
+live. On Windows, use `py install_skill.py ...`; the `install-skill.sh` wrapper
+is provided for macOS/Linux shells.
+
+Before writing anything, the installer validates the skill against the
+[Agent Skills](https://agentskills.io) packaging rules that claude.ai uploads
+and the Skills API enforce: spec-only frontmatter (`name`, `description`,
+`license`, `compatibility`, `metadata`, `allowed-tools`), a lowercase hyphenated
+`name` of at most 64 characters matching the directory, a non-empty
+`description` of at most 1024 characters. The Cowork bundle additionally has
+to fit the 30 MB upload limit, which the packager enforces.
+
+### Automatic cleaning via hook (deterministic)
+
+A skill is an instruction: the model decides whether to invoke it, and the
+model is the thing producing the marks. A **hook** is executed by the harness
+on every matching tool call, cooperation not required. That makes the hook the
+deterministic half of this workflow.
+
+The plugin registers a `PostToolUse` hook on `Write|Edit|MultiEdit|NotebookEdit`
+that runs [`service/scripts/hook_written_file.py`](service/scripts/hook_written_file.py)
+against the file the agent just wrote. Two modes, matching the pre-commit
+convention of check-by-default:
+
+| Mode | Behaviour |
+| --- | --- |
+| `check` (default) | Reports provenance marks, leaves the file alone. Findings go to the model (exit 2), so it can offer to clean them. |
+| `clean` | Strips the marks in place, then tells the model the file on disk changed. |
+
+Set the mode from the plugin's settings (**Hook mode** in `/plugin manage`,
+read by the hook as `CLAUDE_PLUGIN_OPTION_HOOK_MODE`), or with
+`WATERMARKS_HOOK_MODE=clean` in the environment. The hook command deliberately
+does **not** interpolate `${user_config.hook_mode}`: Claude Code refuses to run
+a hook that references an option the user has never opened `/plugin manage` to
+set — a declared `default` does not satisfy it — so interpolating it would mean
+the hook silently never runs on a fresh install. Detection reuses `audit_lib`'s
+`scan_file` / `is_actionable`, so the hook, the pre-commit gate, and the CI
+SARIF export agree on what counts as actionable; cleaning shells out to
+`clean_file.py`, so no cleaning logic is duplicated. `clean` mode writes to a
+sibling temp file and swaps only on a real difference, so files that were
+already clean keep their mtime and don't retrigger file watchers.
+
+Without the plugin, wire it in `~/.claude/settings.json` (or a project
+`.claude/settings.json`) yourself:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["/path/to/watermarks-remover/service/scripts/hook_written_file.py",
+                     "--mode", "check"],
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+On Windows, replace `python3` with `py`.
+
+**What a hook cannot do.** No hook can rewrite the assistant's chat message
+before you read it. Claude Code's `Stop` hook receives `last_assistant_message`
+read-only, and there is no pre-send filter for final responses — the same limit
+this project already documents for Cursor rules. So the deterministic guarantee
+covers **files the agent writes**, plus the
+[pre-commit gate](#pre-commit-hook) for anything on its way into git. Text that
+only ever exists in the chat transcript still depends on the skill workflow,
+which is model-instruction-based and therefore best-effort.
+
+### Claude Code plugin (marketplace)
+
+The repository is also a Claude Code **plugin** and a single-plugin
+**marketplace** (`.claude-plugin/`), so both skills install and update in two
+commands, no clone or script required:
+
+```
+/plugin marketplace add guillaumemeyer/watermarks-remover
+/plugin install watermarks-remover@watermarks-remover
+```
+
+The skills then load namespaced: `/watermarks-remover:remove-ai-marks` and
+`/watermarks-remover:clean-user-facing-text` (the bare `/remove-ai-marks` also
+works when nothing else claims the name). `/plugin marketplace update
+watermarks-remover` pulls later versions. The same works from the CLI with
+`claude plugin marketplace add …` / `claude plugin install …`, and from a local
+checkout by passing a path instead of `owner/repo`.
+
+Maintainers: `make plugin-validate` runs `claude plugin validate . --strict`
+against both manifests; `tests/test_plugin_manifest.py` covers the same files
+without needing the CLI.
+
+### Claude Code
+
+```bash
+# Personal — available in all your projects
+python3 install_skill.py --skill remove-ai-marks --target claude-code
+# or: make install-claude-code-skill
+
+# Project — commit .claude/skills/ to share it with the repo
+python3 install_skill.py --skill remove-ai-marks --target claude-project \
+  --project-dir /path/to/project
+# or: make install-claude-project-skill PROJECT=/path/to/project
+```
+
+Claude Code picks up personal and project skills without a restart; `/skills`
+lists what it loaded. Invoke with `/remove-ai-marks` or ask to “strip AI
+watermarks / C2PA / Claude marks / SynthID-class text.” A project install is
+also what [cloud sessions](https://code.claude.com/docs/en/cloud-environments)
+read, since they clone the repository and load its `.claude/skills/`.
+
+### Cowork (and claude.ai, cloud sessions, routines)
+
+Cowork sessions do **not** read `~/.claude/skills` on your machine — they load
+the skills enabled for your claude.ai account, synced when the session starts.
+So install there by uploading a bundle:
+
+```bash
+python3 install_skill.py --skill remove-ai-marks --target cowork
+# writes dist/remove-ai-marks.zip   (make package-cowork-skill)
+```
+
+Then, in the Claude Desktop app, open **Customize → Skills → Add** and upload
+the zip (the same skill settings on claude.ai work too). The bundle is
+reproducible and contains a single top-level `remove-ai-marks/` directory with
+`SKILL.md` at its root, which is the layout the upload expects.
+
+Service reachability matters more here than in a local install: the skill is a
+thin HTTP client, so the session must be able to reach `WATERMARKS_SERVICE_URL`.
+Cowork sessions that run locally on your machine reach a local `make serve`;
+cloud sessions and routines run remotely and need a service URL reachable from
+there (and `WATERMARKS_SERVER_API_KEY` set on it). If you want a skill with no
+service at all, upload `clean-user-facing-text` instead — it is text-only and
+ships its own scripts:
+
+```bash
+python3 install_skill.py --skill clean-user-facing-text --target cowork
+```
+
+### Grok
 
 ```bash
 # Grok Build / project-local
@@ -43,27 +211,20 @@ mkdir -p ~/.grok/skills
 ln -sfn "$(pwd)/skills/remove-ai-marks" ~/.grok/skills/remove-ai-marks
 ```
 
-Invoke with `/remove-ai-marks` or ask to “strip AI watermarks / C2PA / Claude marks / SynthID-class text.”
-
-### Optional Cursor text-only skill
+### Optional text-only skill
 
 [`skills/clean-user-facing-text/`](skills/clean-user-facing-text/) is a
-self-contained Cursor skill for authorized manuscripts, documentation, and web
-copy. It excludes image, C2PA, service, and external-model tooling.
-
-Install it into `~/.cursor/skills/clean-user-facing-text`:
+self-contained skill for authorized manuscripts, documentation, and web
+copy. It excludes image, C2PA, service, and external-model tooling, and runs
+its own vendored Layer A scripts instead of calling the service.
 
 ```bash
-python3 install_skill.py
+python3 install_skill.py --skill clean-user-facing-text --target claude-code
+python3 install_skill.py --skill clean-user-facing-text --target cursor
 ```
 
-On Windows, use `py install_skill.py`. The `install-skill.sh` wrapper is
-provided for macOS/Linux shells. Existing installations are preserved unless
-you pass `--force`; replacement is staged first and the previous install is
-kept as a uniquely named backup.
-
 Skill invocation is model-selected. Projects that explicitly adopt this
-workflow can also copy the optional rule:
+workflow in Cursor can also copy the optional rule:
 
 ```bash
 mkdir -p /path/to/project/.cursor/rules
@@ -816,15 +977,19 @@ Layer B makes sense when you specifically want the premium model's **thinking an
 | GIF | Comment / XMP application extensions | Drop comment & XMP, keep `NETSCAPE2.0` loop |
 | TIFF (classic + BigTIFF) | IFD tags: XMP, EXIF, GPS, IPTC, MakerNote | Drop tags, zero payloads, keep strips |
 | SVG | `<metadata>`, XMP | Strip blocks |
-| PDF | Byte/XMP + optional tools | **exiftool** then **qpdf**; degraded without either |
+| PDF | Byte/XMP + optional tools | **exiftool** then **qpdf**, then **ghostscript** for metadata inside embedded images; each missing tool degrades a different layer (document strip, structural rewrite, embedded images) |
 | DOCX | docProps / customXml | Scrub props, drop customXml |
 | EPUB | OPF metadata, XHTML meta/JSON-LD, embedded media | Scrub OPF, strip XHTML meta, clean media + Layer A (skips encrypted parts) |
 | ODT | meta.xml | Drop generator / AI-ish meta |
 | HTML | meta, JSON-LD, data-ai* | Strip tags/attrs |
 | Markdown | YAML frontmatter AI keys | Drop keys + Layer A body |
 | MP4 / MOV / M4A / M4V | ISOBMFF `jumb`/`uuid` boxes (same mechanism as AVIF/HEIC) + `moov/udta` generator tags | Drop boxes |
-| WAV | RIFF `LIST INFO` chunk, embedded `id3 ` chunk | Drop chunks |
+| WAV | RIFF `C2PA` / `LIST INFO` chunks, embedded `id3\x20` chunk | Drop chunks |
 | MP3 | ID3v2 frames (v2.3/v2.4 per-frame; v2.2 whole-tag) | Drop matched frames or whole tag |
+| FLAC | C2PA manifest in an ID3v2 `GEOB` frame | Drop the matched frame or whole ID3v2 tag |
+
+FLAC support covers C2PA's standardized ID3v2 carrier. Native FLAC metadata blocks,
+Vorbis Comments, and waveform-domain watermarks are left untouched.
 
 #### Why PDF needs qpdf, not just exiftool
 
@@ -842,6 +1007,58 @@ installed the clean still runs, but it says so:
 ```
 warning: exiftool PDF edits are incremental — the original metadata bytes
 remain recoverable; install qpdf for a structural rewrite
+```
+
+#### Why qpdf is not enough for images inside the PDF
+
+Both passes above work on the document: the Info dictionary, the XMP packet,
+the object graph. Neither descends into an image XObject, so a scan or a
+Photoshop export — a page that *is* one big JPEG — keeps whatever the image
+carries. On a real Photoshop-exported PDF that leaves 27 tags in place after a
+"successful" clean, `IFD0:Software`, the capture timestamps and a preview
+thumbnail among them; a C2PA manifest attached to the same image survives it
+too.
+
+So `clean_pdf` adds a third pass, `deep_images`, driven by Ghostscript's
+`pdfwrite`. It runs in two rungs and stops as soon as the file is clean:
+
+1. **Lossless.** `pdfwrite` with pass-through rebuilds the document from the
+   object graph while copying the compressed image data byte-for-byte — verified
+   by hashing the streams before and after. This clears everything the PDF
+   wrapped around the image. Pass-through covers the codecs Ghostscript supports
+   for it, JPEG (DCTDecode) and JPEG2000 (JPXDecode); Flate, CCITT and LZW
+   images are decoded and re-encoded, which is lossless in practice for those
+   codecs but not byte-identical. `never` is the option for a document whose
+   streams must survive untouched.
+2. **Re-encode, only on evidence.** Anything living in the JPEG's own APPn
+   segments — EXIF in APP1, a C2PA manifest in APP11, Photoshop resources in
+   APP13 — travels with the bytes it is attached to, so pass-through preserves
+   it. Rung 2 runs the same pass with pass-through off, and only when rung 1
+   demonstrably left something behind: an AI/C2PA marker in any mode, or, under
+   `always`, any surviving APPn metadata. APP0 (JFIF) and APP2 (ICC) are left
+   alone — the first is structural and the second decides how the colours are
+   read. Pixels are spent on evidence, never on suspicion.
+
+`deep_images` takes `auto` (default: rung 1 only when markers survived the
+document strip, then rung 2 if they survive that), `always` (rung 1 for every
+PDF, escalating to rung 2 for camera and editor EXIF too), `lossless` (rung 1
+only — never recompress, and report whatever survives through the usual
+`still_has_c2pa` / `post_findings` fields) and `never`. An unrecognised value is
+rejected rather than quietly treated as `auto`. The report says which rungs ran
+via `meta.deep_image_pass` and `meta.images_reencoded`, and when the pass is
+skipped it names the option that would go further:
+
+```text
+deep image pass not needed for AI/C2PA markers; pass deep_images="always"
+to also clear non-AI EXIF inside images
+```
+
+Without Ghostscript installed the clean still runs and says what it could not
+reach:
+
+```text
+warning: metadata inside embedded images left in place; install ghostscript
+for the deep image pass
 ```
 
 Pixel-domain watermark **removal** is now available as an optional external CtrlRegen backend (see above); it is a regenerating remover, not a guarantee. **C2PA soft binding** (in-content watermark that can re-link a remote Content Credentials manifest after metadata is stripped) remains **out of scope**. Stripping hard-bound C2PA does **not** clear those channels.
@@ -892,6 +1109,10 @@ Third-party projects that wrap or complement this repository, listed for discove
 ### unmark-web — browser web UI
 
 [unmark-web](https://github.com/ivanusto/unmark-web) is an independent, MIT-licensed static web client. It removes invisible Unicode marks from text and strips provenance metadata from images entirely in the browser, and can optionally call this repository's HTTP service for the formats it does not handle locally. It is a separate codebase and is not affiliated with this project; see its README for scope and limits.
+
+### ClaudeWatermarks — browser-local text inspector
+
+[ClaudeWatermarks](https://claudewatermarks.com) is an independent, free web tool that inspects pasted text for invisible Unicode carriers entirely in the browser — nothing is uploaded — and lists every finding with its code point, position and surrounding context so the reader decides what to remove. Its inspector engine is published separately as [claude-text-inspector](https://github.com/little-pp395/claude-text-inspector) (MIT, TypeScript); its code-point tables and in-context preservation rules (emoji glue, script joiners, flag tags) follow this repository's Layer A engine. The site also reads C2PA Content Credentials from supported files locally. It does not call this repository's service, and it states plainly that it cannot detect or remove Claude's statistical text mark. It is a separate codebase and is not affiliated with this project; see its README for scope and limits.
 
 ### Adding a project
 
@@ -966,36 +1187,62 @@ make smoke                          # quick CLI smoke on fixtures
 
 ## Changelog
 
+### [v0.6.0](https://github.com/guillaumemeyer/watermarks-remover/releases/tag/v0.6.0) — wider format coverage, Layer A hardening, plugin & hook distribution, and detection-guided rewriting
+
+**Format & container coverage**
+
+- **AVIF / HEIC**: native stdlib metadata and C2PA stripping (#84, #85)
+- **BMP / GIF / TIFF**: stdlib detection, inspection, and metadata cleaning — GIF comment/XMP extensions are dropped while `NETSCAPE2.0` looping and other animation chunks are preserved; TIFF IFD metadata (XMP/EXIF/GPS/IPTC/MakerNote) is dropped with payloads zeroed and strip offsets kept, for both classic and BigTIFF; BMP trailing metadata is truncated with the file-size field rewritten (#107)
+- **EPUB**: stdlib container cleaning — OPF metadata and XHTML meta/JSON-LD scrubbed, embedded raster/SVG media stripped, Layer A applied to XHTML body text, marker-carrying metadata parts dropped, and OCF-encrypted parts passed through untouched (#107)
+- **XLSX / PPTX / DOCX (OOXML)**: native stdlib container metadata, text, and embedded media scrubbing; always empty DOCX `docProps` provenance fields; prune dangling relationships after `customXml` removal; run Layer A over DOCX/ODT body text; decode XML entities before Layer A scrub (#91, #100, #76, #83, #73, #80, #74, #81, #142)
+- **SGML/vector containers**: linear-time metadata stripping for SVG/ODT (GHSA-7vpp-96qp-j9wh) (#147); recursively inspect and clean embedded raster data URIs in SVGs, HTML, and Markdown (#87, #88)
+- **Audio / video**: AI/C2PA metadata stripping for MP4/MOV, WAV, and MP3 (#139); WAV RIFF C2PA chunk detection and removal; FLAC C2PA metadata support; reject partial ID3v2 frame parsing (#232); preserve MP4 media offsets when stripping metadata (#183)
+- **PDF**: reach metadata that lives inside embedded images and stop resizing the PDF to strip XMP; run the deep-image pass whether or not exiftool is installed; honour JPEG marker fill bytes and share one segment walker
+- **PNG**: detect AI generator product names in PNG text metadata; detect AI markers in compressed PNG text (#127); keep the truncated tail instead of dropping it in png/isobmff strips (#182)
+
+**Layer A (invisible Unicode) hardening**
+
+- **Consolidated Layer A hardening** (#133): strip reserved `Default_Ignorable` code points without a legitimate interchange use (`U+2065`, `U+FFF0`–`U+FFF8`, `U+E0000`, `U+E0080`–`U+E00FF`, `U+E01F0`–`U+E0FFF` — reported as `reserved_ignorable`), the 66 noncharacters (`U+FDD0`–`U+FDEF` plus `U+FFFE`/`U+FFFF` per plane — reported as `noncharacter`), and three blank-rendering Default_Ignorable carriers the `Cf` catch-all never saw (`U+180F`, `U+3164`, `U+FFA0`). Each has the same in-context preservation as its already-covered siblings, so partial-syllable text is not corrupted, and each is applied to both the service engine and the vendored lightweight-skill copy
+- **Stop stripping visible-layout format controls next to their own script**: Egyptian hieroglyph quadrat controls (`U+13430`–`U+1343F`), Duployan shorthand controls (`U+1BCA0`–`U+1BCA3`), and musical beam/tie/slur/phrase controls (`U+1D173`–`U+1D17A`) are now preserved when adjacent to their own script and still stripped (and flagged) when floating between unrelated text; `--strip-emoji-glue` paranoid mode still strips them everywhere
+- **Emoji / script polish**: preserve VS16 after emoji singletons outside the block ranges; preserve script joiners, flag emoji, and Arabic Cf marks; preserve multilingual Unicode during text cleanup (#34)
+
+**Layer B rewriting & watermark detection**
+
+- **Iterative, detection-guided Layer B rewriting**: each round generates `--candidates` variants (default 1, `WATERMARKS_REWRITE_CANDIDATES`) and `--max-loops` (default 1, `WATERMARKS_REWRITE_LOOPS`) caps the evaluation rounds, stopping as soon as an attempt passes detection. Evaluator priority: MarkLLM (`--markllm-scheme`) > bigram-Jaccard lexical divergence (fallback). `rewrite_text.py --json-stats` now reports `evaluator` / `max_loops` / `attempts_made` / `passed` and per-attempt `candidate_scores` (#153)
+- **Keyed-Gumbel (Aaronson EXP) same-key verification**: new stdlib-only `detect_gumbel.py` implements the model-free replay test (u = PRF(Hash(key, window), token); exact Gamma-tail p-value; repeated-window masking) with no GPU, model, or logits. `rewrite_text.py --gumbel-key` (env `WATERMARKS_GUMBEL_KEY`, preferred) makes it the iterative-loop evaluator (priority: gumbel > markllm > lexical divergence) and it is exposed as `gumbel` in `/capabilities` and `/detect`. Same-key-only — not a vendor oracle; the key is never logged (#190)
+- **Benchmarks**: multi-scheme MarkLLM text benchmark and detection (#188) and a reproducible SynthID-text removal benchmark (#145); default variants `paraphrase:3`; report and CSV carry attempts per document (`mean_attempts` / `att`, `attempts` / `evaluator` / `passed` columns); `--rewrite-loops` mirrors `--max-loops`
+- **Detection**: vendor text-watermark detection (Gemini SynthID, Claude seam, MarkLLM) plus a SynthID image scorer sidecar (#109); new zero-LLM statistical and stylometric AI text detector for CI and audits (#68, #69)
+
+**Distribution: plugin, hooks, and skill installs**
+
+- **The repository is now a Claude Code plugin and a single-plugin marketplace** (`.claude-plugin/plugin.json` + `marketplace.json`), so both skills install with `/plugin marketplace add guillaumemeyer/watermarks-remover` then `/plugin install watermarks-remover@watermarks-remover`, and update in place. `make plugin-validate` runs `claude plugin validate . --strict`; `tests/test_plugin_manifest.py` checks the manifests without the CLI
+- **`install_skill.py` grew a `--target`** (`claude-code`, `claude-project`, `cowork`, `cursor`) and a `--skill` selector covering both shipped skills, plus `--list`, `--link`, and `CLAUDE_CONFIG_DIR`. The `cowork` target builds a reproducible upload bundle (`dist/<skill>.zip`, single top-level skill directory); every target validates against the Agent Skills packaging rules and the 30 MB upload limit. New `make` targets: `install-claude-code-skill`, `install-claude-code-text-skill`, `install-claude-project-skill`, `package-cowork-skill`, `package-cowork-text-skill`
+- **Deterministic auto-cleaning via a `PostToolUse` hook** (`hooks/hooks.json` + `service/scripts/hook_written_file.py`): after the agent writes a file the harness runs the hook whether or not the model cooperates. `check` (default) reports marks to the model; `clean` strips them in place and tells the model the file moved, swapping only on a real difference so clean files keep their mtime. Mode comes from the plugin's `hook_mode` setting or `WATERMARKS_HOOK_MODE`; detection reuses `audit_lib.scan_file` / `is_actionable`, so the hook, the pre-commit gate, and the CI SARIF export agree. A hook still cannot rewrite the assistant's chat message — no such hook point exists — so that path stays best-effort
+- **Pre-commit hook integration** for staged-file checking/cleaning (#138); lightweight Cursor text skill (#35); `clean-user-facing-text`'s description no longer names Cursor as the only host
+
+**HTTP service**
+
+- Batch endpoints: `POST /clean/batch`, `/inspect/batch` (#137) and `POST /detect/batch` (#151)
+- Preserve image format extensions in `/clean` and use safe writes in `av_meta` (#150); use portable base64 in the `/detect` curl example (and fix the macOS `realpath` portability in the bootstraps, #185)
+
+**Audit / inspection & security**
+
+- `audit_dir.py` gained multi-worker concurrency and SARIF 2.1.0 export (#101, #102)
+- Route website binary formats to their real scanners (#177); refuse DTD/entity bombs in the sitemap parser (GHSA-pjg6-92pm-mmcf) (#146); a crashed cleaner blocks the commit instead of reading as clean (#179); an unreadable text file is a failed scan, not a clean one (#169)
+
+**Reliability & correctness fixes**
+
+- A second `--in-place` run preserves the original `.bak`; keep collected evidence when a later zip member fails to read (#175); truncated ISOBMFF containers still run the C2PA byte-scan fallback (#176); distinguish a failed cleaner from an already-clean file (#159, #161); treat a failed c2patool run as inconclusive rather than "no C2PA" (#156); validate clean option types (#111); never auto-select MPS device for text watermark detection (#99); macOS portability — pure `--json` stdout for the SynthID scorer and BSD `realpath` probe (#70); fix a Windows `subprocess_creationflags` path in `_ghostscript_usable` and stop child processes from opening a console window on Windows
+- Behavioural hardening: preserve benign JPEG comments keep-mode; fix the `bench-synthid-text` swallowed flag; simplify flag passthrough for the Ghostscript probe and clean_text unneeded noqa (lint)
+
+**CI / tooling / docs**
+
+- Ruff linting and formatting with CI enforcement (#103); add macOS to the test matrix (#152); add a CodeRabbit config for automated PR reviews (#222); CODEOWNERS for CODE_OF_CONDUCT/LICENSE and main-review owners; attribute copyright to Guillaume Meyer and contributors (#228)
+- Docs: voice-preserving rewrite guidance and protecting voice/accessibility choices; Ecosystem additions (ClaudeWatermarks, unmark-web) and a note discouraging look-alike names; arXiv 2402.14904 reference; Windows auto-start guide via Task Scheduler; portable base64 in curl examples; pin the vendored Cursor-skill text engine to the service copy (#96)
+
 ### Unreleased
 
-- **Strip reserved Default_Ignorable code points in Layer A**: `U+2065`, `U+FFF0`–`U+FFF8`, `U+E0000`, `U+E0080`–`U+E00FF`, and `U+E01F0`–`U+E0FFF` are unassigned code points carrying `Other_Default_Ignorable_Code_Point=Yes`, so conformant renderers display them invisibly, normalisation preserves them, and category-based (`Cf`) scrubbing never sees them: ideal covert carriers with no legitimate use in interchange text. Layer A now strips them and inspect reports them under the new `reserved_ignorable` kind. Applied to both the service engine and the vendored lightweight-skill copy
-- **Fix Layer A missing three invisible Default_Ignorable carriers**: `U+180F` (Mongolian free variation selector-4, added in Unicode 14), `U+3164` (Hangul filler), and `U+FFA0` (halfwidth Hangul filler) are blank-rendering Default_Ignorable code points, but their Unicode categories (`Mn`/`Lo`) meant the `Cf` catch-all never saw them and they were absent from the strip set — so both `inspect_text` and `clean_text` passed them through untouched even between plain ASCII. They are now stripped and flagged like their already-covered siblings (`U+180B`–`U+180D`, `U+115F`/`U+1160`), with the same in-context preservation: `U+180F` is kept after a Mongolian letter exactly like FVS1–3, and `U+3164`/`U+FFA0` are kept after a Hangul jamo of their own presentation form (compatibility jamo `U+3131`–`U+318E`, halfwidth jamo `U+FFA1`–`U+FFDC`) exactly like the conjoining fillers, so partial-syllable text is not corrupted. Applied to both the service engine and the vendored lightweight-skill copy
-- **Strip Unicode noncharacters in Layer A**: the 66 noncharacters (`U+FDD0`–`U+FDEF` plus `U+FFFE`/`U+FFFF` at the end of every plane) are permanently reserved for internal use and prohibited in interchange text, render as nothing or tofu, and survive normalisation, yet both `inspect_text` and `clean_text` passed them through untouched: a ready-made covert channel. Layer A now strips them and inspect reports them under the new `noncharacter` kind. Unlike other reserved ranges they can never be assigned, so stripping carries no future-Unicode risk. Applied to both the service engine and the vendored lightweight-skill copy
-- **Stop stripping visible-layout format controls next to their own script**: Egyptian hieroglyph quadrat controls (`U+13430`–`U+1343F`), Duployan shorthand controls (`U+1BCA0`–`U+1BCA3`), and musical beam/tie/slur/phrase controls (`U+1D173`–`U+1D17A`) are category `Cf`, so the catch-all stripped them, yet they visibly govern how their script renders (quadrat stacking, shorthand overlaps, beaming): removing them changes the rendered text, contradicting the "cleaners preserve the document body" invariant. They are now preserved when adjacent to their own script, exactly like the existing Mongolian/Khmer/Hangul handling, and still stripped (and flagged) when floating between unrelated text; `--strip-emoji-glue` paranoid mode still strips them everywhere. Applied to both the service engine and the vendored lightweight-skill copy
-- **Layer B rewriting is now iterative and evaluation-driven**: each round
-  generates `--candidates` variants (default 1,
-  `WATERMARKS_REWRITE_CANDIDATES`) and `--max-loops` (default 1,
-  `WATERMARKS_REWRITE_LOOPS`) caps the evaluation rounds, stopping as soon
-  as an attempt passes watermark detection. Evaluator priority: MarkLLM (when
-  `--markllm-scheme`) > bigram-Jaccard lexical divergence (fallback; a
-  vendor-detector seam is reserved for a future SynthID-text endpoint).
-- `rewrite_text.py --json-stats` now reports `evaluator` /
-  `max_loops` / `attempts_made` / `passed` and per-attempt
-  `candidate_scores` records (`loop`, `passed`, `evaluation`);
-  `markllm.before/after/cleared` is unchanged.
-- **SynthID-text benchmark**: default variants `paraphrase:3`; report and CSV
-  now carry attempts per document (`mean_attempts`, `att` column;
-  `attempts` / `evaluator` / `passed` columns); `--rewrite-loops`
-  mirrors `--max-loops`.
-- **Keyed-Gumbel (Aaronson EXP) same-key verification**: new stdlib-only
-  `detect_gumbel.py` implements the model-free replay test of ARBI's keyed-Gumbel
-  report (u = PRF(Hash(key, window), token); exact Gamma-tail p-value; repeated-
-  window masking) — no GPU, model, or logits. `rewrite_text.py --gumbel-key`
-  (env `WATERMARKS_GUMBEL_KEY`, preferred) makes it the iterative-loop evaluator
-  (priority: gumbel > markllm > lexical divergence) with a `gumbel.before/after/
-  cleared` report; the detector is also exposed as `gumbel` in `/capabilities`
-  and `/detect`. Same-key-only: valid against the same key, tokenizer, and PRF
-  layout used at generation — not a vendor oracle. The key is never logged.
+- Pre-commit clean hook (`watermarks-remover-clean` / `clean_staged.py`): use content digests (`SHA-256`) and active action detection so clean files on disk are recognized without demanding infinite re-staging (#173)
 
 ### [v0.5.0](https://github.com/guillaumemeyer/watermarks-remover/releases/tag/v0.5.0) — service & Docker distribution, HTTP API, and verification harnesses
 
