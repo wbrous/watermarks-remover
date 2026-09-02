@@ -32,7 +32,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from common import EXIT_PARTIAL, MAX_INPUT_BYTES, eprint, subprocess_creationflags
+from common import (
+    EXIT_PARTIAL,
+    MAX_INPUT_BYTES,
+    eprint,
+    result_has_changes,
+    subprocess_creationflags,
+)
 
 CLEAN_FILE_PY = Path(__file__).resolve().parent / "clean_file.py"
 
@@ -60,31 +66,8 @@ def _is_modifying_action(action: str) -> bool:
 
 
 def _changed(result: dict) -> bool:
-    """Determine whether a clean_file.py JSON report indicates content was modified.
-
-    This function serves strictly as a fallback when before/after digests on
-    disk cannot be computed. Text cleaning reports explicit removal/replacement
-    statistics. For binary and container cleaners, actions that removed nothing
-    append a 'nothing was removed' filler message (issue #173), so a non-empty
-    actions list alone cannot indicate change. A change is confirmed when byte
-    counts differ, explicit change flags are set, or active modifying actions
-    (e.g. dropping chunks, blanking XMP packets) are present in the report.
-    """
-    if "changed" in result:
-        return bool(result["changed"])
-    stats = result.get("stats")
-    if stats is not None:
-        return bool(stats.get("removed_count") or stats.get("replaced_count"))
-    bytes_in = result.get("bytes_in")
-    bytes_out = result.get("bytes_out")
-    if bytes_in is not None and bytes_out is not None:
-        # image/av/container reports always carry a non-empty `actions` log
-        # (including a "no X removed" placeholder when nothing happened), so
-        # `bool(actions)` is never a reliable no-op signal for these kinds —
-        # it reported every already-clean file as "changed" forever. Byte
-        # length is the actual ground truth for whether anything was written.
-        return bytes_in != bytes_out
-    return bool(result.get("actions"))
+    """Determine whether a clean_file.py JSON report indicates content was modified."""
+    return result_has_changes(result)
 
 
 def _failure_detail(proc: subprocess.CompletedProcess[str], summary: str) -> str:

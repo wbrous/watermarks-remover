@@ -143,6 +143,81 @@ def test_html_cms_generator_attribute_names_are_case_insensitive():
     assert clean_html(ai_html)[0] == ""
 
 
+def test_html_jsonld_ai_block_detected_and_cleaned():
+    ai = (
+        '<script type="application/ld+json">'
+        '{"@type":"CreativeWork","digitalSourceType":"trainedAlgorithmicMedia"}'
+        "</script>"
+    )
+    _has_c2pa, has_ai, findings, _ = inspect_html(ai)
+    assert has_ai is True
+    assert any("json-ld provenance-like block" in f for f in findings)
+    cleaned, _actions = clean_html(ai)
+    assert "digitalSourceType" not in cleaned
+
+
+def test_html_jsonld_clean_keeps_plain_jsonld_and_regular_scripts():
+    # Only json-ld blocks that actually carry AI provenance are dropped. A plain
+    # json-ld block and an ordinary <script> that merely mention the marker
+    # text must be preserved (the tag scanner + separate type check must not
+    # over-match non-jsonld scripts).
+    html = (
+        '<script type="application/ld+json">{"@type":"Book","name":"plain"}</script>'
+        '<script>var x = "trainedAlgorithmicMedia";</script>'
+    )
+    _c2, _has_ai, _findings, _ = inspect_html(html)
+    cleaned, actions = clean_html(html)
+    assert cleaned == html
+    assert not any("json-ld" in a for a in actions)
+
+
+def test_html_jsonld_form_feed_is_whitespace():
+    # HTML treats form feed (\f) as whitespace, so it must separate the tag name
+    # from the type attribute rather than being consumed into the tag name.
+    ai = (
+        '<script\ftype="application/ld+json">'
+        '{"@type":"CreativeWork","digitalSourceType":"trainedAlgorithmicMedia"}'
+        "</script>"
+    )
+    _has_c2pa, has_ai, findings, _ = inspect_html(ai)
+    assert has_ai is True
+    assert any("json-ld provenance-like block" in f for f in findings)
+    cleaned, _actions = clean_html(ai)
+    assert "digitalSourceType" not in cleaned
+
+
+def test_html_jsonld_opening_tag_longer_than_2048():
+    # A valid opening tag longer than 2048 characters must still be detected
+    # (no arbitrary length cap on the tag-scan boundary).
+    padding = " ".join(f'data-{i}="x"' for i in range(300))
+    ai = (
+        f'<script {padding} type="application/ld+json">'
+        '{"@type":"Image","digitalSourceType":"trainedAlgorithmicMedia"}'
+        "</script>"
+    )
+    assert len(ai.split(">", 1)[0]) > 2048
+    _has_c2pa, has_ai, findings, _ = inspect_html(ai)
+    assert has_ai is True
+    assert any("json-ld provenance-like block" in f for f in findings)
+    cleaned, _actions = clean_html(ai)
+    assert "digitalSourceType" not in cleaned
+
+
+def test_html_jsonld_gt_in_quoted_attribute_value():
+    # A '>' inside a quoted attribute value must not be treated as the end of
+    # the opening tag.
+    ai = (
+        '<script title="a > b" type="application/ld+json">'
+        '{"@type":"Image","digitalSourceType":"trainedAlgorithmicMedia"}'
+        "</script>"
+    )
+    _has_c2pa, has_ai, findings, _ = inspect_html(ai)
+    assert has_ai is True
+    assert any("json-ld provenance-like block" in f for f in findings)
+    cleaned, _actions = clean_html(ai)
+    assert "digitalSourceType" not in cleaned
+
+
 def test_html_ai_generator_still_dropped():
     html = '<meta name="generator" content="Claude">'
     cleaned, actions = clean_html(html)
@@ -175,7 +250,10 @@ def test_svg_metadata():
     assert any("metadata" in a or "drop" in a for a in actions)
 
 
-def _make_docx_with_app(app_name: str = "Claude AI Writer") -> bytes:
+def _make_docx_with_app(
+    app_name: str = "Microsoft Macintosh Word", company: str = "Acme AI Corp"
+) -> bytes:
+    """Generate a synthetic DOCX bytes payload containing extended app properties."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
         zf.writestr(
@@ -184,7 +262,7 @@ def _make_docx_with_app(app_name: str = "Claude AI Writer") -> bytes:
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="xml" ContentType="application/xml"/>
   <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
-  <Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>
+  <Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>
   <Override PartName="/customXml/item1.xml" ContentType="application/xml"/>
 </Types>""",
         )
@@ -194,7 +272,7 @@ def _make_docx_with_app(app_name: str = "Claude AI Writer") -> bytes:
         )
         zf.writestr(
             "docProps/app.xml",
-            f'<?xml version="1.0"?><Properties><Application>{app_name}</Application></Properties>',
+            f'<?xml version="1.0"?><Properties><Application>{app_name}</Application><Company>{company}</Company><AppVersion>14.0000</AppVersion></Properties>',
         )
         zf.writestr(
             "customXml/item1.xml",
@@ -204,15 +282,21 @@ def _make_docx_with_app(app_name: str = "Claude AI Writer") -> bytes:
 
 
 def test_docx_strips_app_and_customxml(tmp_path: Path):
+    """Verify DOCX cleans Application/Company and customXml while keeping AppVersion."""
     data = _make_docx_with_app()
     cleaned, actions = clean_docx(data)
-    assert any("customXml" in a or "Application" in a or "drop" in a for a in actions)
+    assert any(
+        "customXml" in a or "Application" in a or "Company" in a or "drop" in a for a in actions
+    )
     with zipfile.ZipFile(io.BytesIO(cleaned)) as zf:
         names = zf.namelist()
         assert "word/document.xml" in names
         assert not any(n.startswith("customXml/") for n in names)
         app = zf.read("docProps/app.xml").decode()
-        assert "Claude" not in app
+        assert "Acme AI Corp" not in app
+        assert "<Application></Application>" in app or "<Application/>" in app
+        # AppVersion is preserved to avoid ECMA-376 schema corruption (#283)
+        assert "<AppVersion>14.0000</AppVersion>" in app
 
 
 def _dangling_rels(zip_bytes: bytes) -> list[str]:
@@ -408,6 +492,7 @@ def _make_docx_with_invisible_body() -> bytes:
 
 
 def test_docx_scrubs_docprops_provenance_fields_unconditionally():
+    """Verify unconditional scrubbing of docProps provenance fields in DOCX."""
     import xml.etree.ElementTree as ET
 
     data = _make_docx_with_docprops()
@@ -434,9 +519,10 @@ def test_docx_scrubs_docprops_provenance_fields_unconditionally():
         "cp:category",
     ):
         assert f"<{field}></{field}>" in core or f"<{field}/>" in core
-    for field in ("Application", "AppVersion", "Company", "Manager"):
+    for field in ("Application", "Company", "Manager"):
         assert f"<{field}></{field}>" in app or f"<{field}/>" in app
-    # ...while dc:title survives
+    # ...while AppVersion and dc:title survive (issue #283)
+    assert "<AppVersion>16.0</AppVersion>" in app
     assert "<dc:title>My Document</dc:title>" in core
     assert "ChatGPT" not in core
     assert "Generated by AI" not in core
@@ -791,3 +877,66 @@ def test_zip_budget_rejection_propagates_from_inspect(monkeypatch):
     monkeypatch.setattr(container_meta, "MAX_ZIP_DECOMPRESSED_BYTES", 1)
     with pytest.raises(container_meta.ZipBudgetExceeded):
         inspect_docx(buf.getvalue())
+
+
+def test_zip_budget_rejection_propagates_from_detect_container_format_mimetype(monkeypatch):
+    import container_meta
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("mimetype", "application/epub+zip")
+    monkeypatch.setattr(container_meta, "MAX_ZIP_DECOMPRESSED_BYTES", 5)
+    with pytest.raises(container_meta.ZipBudgetExceeded):
+        detect_container_format(Path("x.bin"), buf.getvalue())
+
+
+def test_docx_clean_preserves_ooxml_appversion_schema_validity():
+    """clean_docx preserves AppVersion while scrubbing application provenance (#283)."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(
+            "[Content_Types].xml",
+            """<?xml version="1.0"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+  <Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>
+  <Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>
+</Types>""",
+        )
+        zf.writestr(
+            "word/document.xml",
+            '<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Hello world</w:t></w:r></w:p></w:body></w:document>',
+        )
+        zf.writestr(
+            "docProps/core.xml",
+            """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <dc:creator>Test Author</dc:creator>
+  <dc:description>Generated Document</dc:description>
+</cp:coreProperties>""",
+        )
+        zf.writestr(
+            "docProps/app.xml",
+            """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties">
+  <Application>Microsoft Macintosh Word</Application>
+  <AppVersion>16.0000</AppVersion>
+  <Company>Test Corp</Company>
+  <Manager>Test Manager</Manager>
+</Properties>""",
+        )
+    data = buf.getvalue()
+    cleaned, actions = clean_docx(data)
+    assert any("scrub docProps/core.xml field dc:creator" in a for a in actions)
+    assert any("scrub docProps/app.xml field Application" in a for a in actions)
+    assert any("scrub docProps/app.xml field Company" in a for a in actions)
+    assert any("scrub docProps/app.xml field Manager" in a for a in actions)
+    assert not any("AppVersion" in a for a in actions)
+
+    with zipfile.ZipFile(io.BytesIO(cleaned)) as zf:
+        app = zf.read("docProps/app.xml").decode("utf-8")
+        assert "<Application></Application>" in app or "<Application/>" in app
+        assert "<AppVersion>16.0000</AppVersion>" in app
+        assert "<Company></Company>" in app or "<Company/>" in app
+        assert "<Manager></Manager>" in app or "<Manager/>" in app

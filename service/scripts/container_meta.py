@@ -15,6 +15,7 @@ import time
 import urllib.parse
 import zipfile
 import zlib
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -77,6 +78,52 @@ _ZIP_PARSE_ERRORS = (
     ValueError,
     zlib.error,
 )
+
+MAX_ZIP_DECOMPRESSED_BYTES = 128 * 1024 * 1024
+
+
+def _check_zip_budget(info: zipfile.ZipInfo, budget: list[int]) -> None:
+    """Fast-path zip-bomb guard on the declared member size.
+
+    A single member whose *declared* size already exceeds the cap is
+    rejected before any decompression. The authoritative accounting lives in
+    _read_zip_member, which charges **actual** decompressed bytes to the
+    shared budget: ZipInfo.file_size comes from the archive central
+    directory and is attacker-controlled, so trusting it for the cumulative
+    limit would let a crafted archive declare a tiny size and still expand
+    to gigabytes.
+    """
+    if info.file_size > MAX_ZIP_DECOMPRESSED_BYTES:
+        raise ZipBudgetExceeded(
+            "zip decompressed size exceeds cap "
+            f"({MAX_ZIP_DECOMPRESSED_BYTES} bytes); refusing to process"
+        )
+
+
+def _read_zip_member(zf: zipfile.ZipFile, info: zipfile.ZipInfo, budget: list[int]) -> bytes:
+    """Read one zip member, charging real decompressed bytes to the budget.
+
+    Streams the member in chunks so the cumulative cap is enforced on bytes
+    actually produced, not on the declared ``file_size``; raises
+    ``ZipBudgetExceeded`` the moment the cap is crossed, before the whole
+    member is buffered.
+    """
+    _check_zip_budget(info, budget)
+    with zf.open(info) as stream:
+        chunks: list[bytes] = []
+        while True:
+            chunk = stream.read(1 << 16)
+            if not chunk:
+                break
+            budget[0] += len(chunk)
+            if budget[0] > MAX_ZIP_DECOMPRESSED_BYTES:
+                raise ZipBudgetExceeded(
+                    "zip decompressed size exceeds cap "
+                    f"({MAX_ZIP_DECOMPRESSED_BYTES} bytes); refusing to process"
+                )
+            chunks.append(chunk)
+    return b"".join(chunks)
+
 
 # Frontmatter / meta keys that often carry AI provenance
 AI_FRONTMATTER_KEYS = frozenset(
@@ -204,13 +251,27 @@ def detect_container_format(path: Path, data: bytes | None = None) -> str:
             try:
                 with zipfile.ZipFile(io.BytesIO(data)) as zf:
                     names = set(zf.namelist())
-                    if "word/document.xml" in names:
+                    if "mimetype" in names:
+                        info = zf.getinfo("mimetype")
+                        budget = [0]
+                        raw = _read_zip_member(zf, info, budget)
+                        try:
+                            mt = raw.decode("ascii", errors="ignore").strip()
+                            if "epub" in mt:
+                                return "epub"
+                            if "opendocument" in mt or "oasis" in mt:
+                                return "odt"
+                        except (UnicodeDecodeError, AttributeError):
+                            pass
+                    if "word/document.xml" in names or any(n.startswith("word/") for n in names):
                         return "docx"
-                    if "xl/workbook.xml" in names:
+                    if "xl/workbook.xml" in names or any(n.startswith("xl/") for n in names):
                         return "xlsx"
-                    if "ppt/presentation.xml" in names:
+                    if "ppt/presentation.xml" in names or any(n.startswith("ppt/") for n in names):
                         return "pptx"
-                    if "content.xml" in names and "meta.xml" in names:
+                    if "content.xml" in names and (
+                        "meta.xml" in names or "META-INF/manifest.xml" in names
+                    ):
                         return "odt"
                     if "META-INF/container.xml" in names and any(n.endswith(".opf") for n in names):
                         return "epub"
@@ -237,10 +298,77 @@ def _blob_hits(blob: bytes) -> tuple[bool, bool, list[str]]:
     return has_c2pa, has_ai or has_c2pa, findings[:30]
 
 
-RE_DATA_IMAGE_URI = re.compile(
-    r"data:image\/(?P<mime>[a-zA-Z0-9\+\-\.]+)(?P<params>;[^\s\"'\)<>]+)?,(?P<payload>[A-Za-z0-9+/=\s%]+)",
-    re.I,
-)
+# Charsets for the hand-written data-URI parser below. Parsing the URI
+# structure with plain string scans (instead of a regex) keeps the pass linear
+# and accepts any MIME parameter sequence with no fixed counts or length limits,
+# while also never feeding a user-controlled string to a regex engine.
+_ASCII_ALNUM = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
+_DATA_URI_MIME_CHARS = _ASCII_ALNUM | frozenset("+-.")
+_DATA_URI_PAYLOAD_CHARS = _ASCII_ALNUM | frozenset("+/=%")
+# Characters that can never appear in an unquoted data-URI body; they terminate
+# a candidate span and cannot be part of its header or payload.
+_DATA_URI_BREAK = frozenset("\"'<>()")
+# Characters that end a parameter value: the ';' and ',' separators plus the
+# boundary set above.
+_DATA_URI_PARAM_BREAK = _DATA_URI_BREAK | frozenset(",;")
+
+
+def _iter_data_uris(text: str) -> Iterator[tuple[int, int, str, str, str]]:
+    """Yield (start, end, mime, params, payload) for each data:image URI.
+
+    Linear regardless of input shape: each candidate ('data:image/' up to the
+    next quote/angle/paren) is parsed once, and a candidate that does not form a
+    URI is skipped across, so an adversarial "data:image/+;" flood costs one
+    pass, not a rescan per prefix.
+    """
+    n = len(text)
+    pos = 0
+    low = text.lower()
+    while True:
+        i = low.find("data:image/", pos)
+        if i < 0:
+            return
+        k = i + len("data:image/")
+        mime_start = k
+        while k < n and text[k] in _DATA_URI_MIME_CHARS:
+            k += 1
+        mime = text[mime_start:k]
+        if not mime:
+            pos = i + 1
+            continue
+        params_start = k
+        while k < n and text[k] == ";":
+            k += 1
+            while k < n and text[k] not in _DATA_URI_PARAM_BREAK and not text[k].isspace():
+                k += 1
+        params = text[params_start:k]
+        if k >= n or text[k] != ",":
+            pos = _skip_data_uri_candidate(text, i)
+            continue
+        k += 1  # comma
+        payload_start = k
+        while k < n and (text[k] in _DATA_URI_PAYLOAD_CHARS or text[k].isspace()):
+            k += 1
+        payload = text[payload_start:k]
+        if not payload:
+            pos = _skip_data_uri_candidate(text, i)
+            continue
+        yield i, k, mime, params, payload
+        pos = k
+
+
+def _skip_data_uri_candidate(text: str, start: int) -> int:
+    """Return the position to resume scanning after a non-URI candidate.
+
+    Skips past the current 'data:image/' candidate (to its terminating
+    quote/angle/paren or end of text), so a document full of 'data:image/+;'
+    with no comma costs one pass rather than a rescan per prefix.
+    """
+    n = len(text)
+    j = start
+    while j < n and text[j] not in _DATA_URI_BREAK:
+        j += 1
+    return j if j > start + 1 else start + 1
 
 
 def _inspect_embedded_data_uris(text: str) -> tuple[bool, bool, list[str]]:
@@ -248,11 +376,10 @@ def _inspect_embedded_data_uris(text: str) -> tuple[bool, bool, list[str]]:
     has_ai = False
     findings: list[str] = []
 
-    for m in RE_DATA_IMAGE_URI.finditer(text):
-        mime = m.group("mime").lower()
-        params = (m.group("params") or "").lower()
-        payload = m.group("payload")
-        is_b64 = "base64" in params
+    for _start, _end, mime, params, payload in _iter_data_uris(text):
+        mime_l = mime.lower()
+        params_l = params.lower()
+        is_b64 = "base64" in params_l
 
         try:
             if is_b64:
@@ -278,7 +405,7 @@ def _inspect_embedded_data_uris(text: str) -> tuple[bool, bool, list[str]]:
             sub_c2pa, sub_ai, sub_findings = inspect_webp(data)
         elif fmt in ("avif", "heic"):
             sub_c2pa, sub_ai, sub_findings = inspect_isobmff(data, fmt)
-        elif "svg" in mime or data.lstrip().startswith(b"<"):
+        elif "svg" in mime_l or data.lstrip().startswith(b"<"):
             sub_c2pa, sub_ai, sub_findings, _ = inspect_svg(data)
         else:
             sub_c2pa, sub_ai, sub_findings = _blob_hits(data)
@@ -288,7 +415,7 @@ def _inspect_embedded_data_uris(text: str) -> tuple[bool, bool, list[str]]:
         if sub_ai or sub_c2pa:
             has_ai = True
         for f in sub_findings:
-            findings.append(f"embedded data:image/{mime}: {f}")
+            findings.append(f"embedded data:image/{mime_l}: {f}")
 
     return has_c2pa, has_ai, findings
 
@@ -298,11 +425,8 @@ def _clean_embedded_data_uris(
 ) -> tuple[str, list[str]]:
     actions: list[str] = []
 
-    def _replace_uri(m: re.Match[str]) -> str:
-        full_match = m.group(0)
-        mime = m.group("mime")
-        params = m.group("params") or ""
-        payload = m.group("payload")
+    def _clean_one(mime: str, params: str, payload: str) -> str | None:
+        """Return the rebuilt data URI, or None when nothing changed."""
         is_b64 = "base64" in params.lower()
 
         try:
@@ -315,10 +439,10 @@ def _clean_embedded_data_uris(
             else:
                 data = urllib.parse.unquote_to_bytes(payload)
         except Exception:
-            return full_match
+            return None
 
         if not data:
-            return full_match
+            return None
 
         fmt = detect_image_format(data)
         sub_actions: list[str] = []
@@ -338,22 +462,27 @@ def _clean_embedded_data_uris(
             elif "svg" in mime.lower() or data.lstrip().startswith(b"<"):
                 cleaned_bytes, sub_actions = clean_svg(data)
         except Exception:
-            return full_match
+            return None
 
         if not any("drop" in a.lower() for a in sub_actions) or cleaned_bytes == data:
-            return full_match
+            return None
 
         actions.append(f"cleaned embedded data:image/{mime} ({', '.join(sub_actions[:2])})")
 
         if is_b64:
             new_b64 = base64.b64encode(cleaned_bytes).decode("ascii")
             return f"data:image/{mime}{params},{new_b64}"
-        else:
-            new_payload = urllib.parse.quote_from_bytes(cleaned_bytes)
-            return f"data:image/{mime}{params},{new_payload}"
+        return f"data:image/{mime}{params},{urllib.parse.quote_from_bytes(cleaned_bytes)}"
 
-    out = RE_DATA_IMAGE_URI.sub(_replace_uri, text)
-    return out, actions
+    out: list[str] = []
+    last = 0
+    for start, end, mime, params, payload in _iter_data_uris(text):
+        out.append(text[last:start])
+        rebuilt = _clean_one(mime, params, payload)
+        out.append(text[start:end] if rebuilt is None else rebuilt)
+        last = end
+    out.append(text[last:])
+    return "".join(out), actions
 
 
 # ---------------------------------------------------------------------------
@@ -578,11 +707,118 @@ def _is_cms_generator_meta(tag: str) -> bool:
     return not (_GENERATOR_AI_RE.search(attrs.get("content", "")) or _GENERATOR_AI_RE.search(tag))
 
 
-_JSONLD_OPEN_RE = re.compile(
-    r"""<script\b[^>]*type\s*=\s*["']application/ld\+json["'][^>]*>""",
-    re.I,
-)
 _JSONLD_CLOSE_RE = re.compile(r"</script>", re.I)
+# HTML treats form feed as whitespace; include it wherever attribute separators
+# are checked.
+_HTML_SPACE = " \t\r\n\f"
+
+
+def _find_tag_end(text: str, start: int) -> int:
+    """Return the index just after the closing '>' of the tag at 'start'.
+
+    Quote-aware: a '>' inside a quoted attribute value does not end the tag.
+    Linear; returns len(text) when the tag is unterminated.
+    """
+    n = len(text)
+    i = start + 1
+    while i < n:
+        c = text[i]
+        if c == ">":
+            return i + 1
+        if c in "\"'":
+            quote = c
+            i += 1
+            while i < n and text[i] != quote:
+                i += 1
+            i += 1  # skip closing quote
+        else:
+            i += 1
+    return n
+
+
+def _iter_script_blocks(
+    text: str,
+) -> Iterator[tuple[int, int, int, int]]:
+    """Yield (open_start, open_end, close_start, close_end) for script blocks.
+
+    Linear and quote-aware, with no length cap on the opening tag: each opening
+    tag is scanned to its true boundary and closing tags are advanced by a
+    forward pointer, so an unterminated run of '<script' costs one pass, not a
+    rescan per prefix. Yields the same 4-tuple shape as _iter_tag_blocks.
+    """
+    closes = [m.start() for m in _JSONLD_CLOSE_RE.finditer(text)]
+    ci = 0
+    last_end = 0
+    pos = 0
+    n = len(text)
+    low = text.lower()
+    while True:
+        i = low.find("<script", pos)
+        if i < 0:
+            return
+        after = i + 7
+        if after >= n or text[after] not in ">" + _HTML_SPACE + "/":
+            pos = i + 1
+            continue
+        open_end = _find_tag_end(text, i)
+        if i < last_end:
+            pos = max(open_end, i + 1)
+            continue
+        while ci < len(closes) and closes[ci] < open_end:
+            ci += 1
+        if ci >= len(closes):
+            return
+        close_start = closes[ci]
+        close_end = close_start + len("</script>")
+        yield i, open_end, close_start, close_end
+        last_end = close_end
+        pos = open_end
+
+
+def _script_tag_is_jsonld(open_tag: str) -> bool:
+    """True iff the opening tag has a top-level type="application/ld+json".
+
+    Single-pass and quote-aware: quoted attribute values are skipped as a unit,
+    so only an actual top-level attribute named 'type' with the JSON-LD value
+    is matched. Linear in the tag length.
+    """
+    i, n = 0, len(open_tag)
+    if i < n and open_tag[i] == "<":
+        i += 1
+    while i < n and open_tag[i] not in _HTML_SPACE + "/>":  # tag name
+        i += 1
+    while i < n:
+        while i < n and open_tag[i] in _HTML_SPACE:
+            i += 1
+        if i >= n or open_tag[i] == ">":
+            return False
+        name_start = i
+        while i < n and open_tag[i] not in "=" + _HTML_SPACE + "/>":
+            i += 1
+        name = open_tag[name_start:i]
+        while i < n and open_tag[i] in _HTML_SPACE:
+            i += 1
+        value = ""
+        if i < n and open_tag[i] == "=":
+            i += 1
+            while i < n and open_tag[i] in _HTML_SPACE:
+                i += 1
+            if i < n and open_tag[i] in "\"'":
+                quote = open_tag[i]
+                i += 1
+                value_start = i
+                while i < n and open_tag[i] != quote:
+                    i += 1
+                value = open_tag[value_start:i]
+                i += 1  # skip closing quote
+            else:
+                value_start = i
+                while i < n and open_tag[i] not in _HTML_SPACE + ">":
+                    i += 1
+                value = open_tag[value_start:i]
+        if name.lower() == "type" and value.lower() == "application/ld+json":
+            return True
+    return False
 
 
 def inspect_html(text: str) -> tuple[bool, bool, list[str], dict]:
@@ -600,7 +836,9 @@ def inspect_html(text: str) -> tuple[bool, bool, list[str], dict]:
         ):
             has_ai = True
             findings.append(f"meta: {tag[:120]}")
-    for os_, _oe, _cs, ce in _iter_tag_blocks(text, _JSONLD_OPEN_RE, _JSONLD_CLOSE_RE):
+    for os_, oe, _cs, ce in _iter_script_blocks(text):
+        if not _script_tag_is_jsonld(text[os_:oe]):
+            continue
         blob = text[os_:ce]
         if AI_META_NAME_RE.search(blob) or re.search(
             r"DigitalSourceType|trainedAlgorithmicMedia|SoftwareAgent", blob, re.I
@@ -640,15 +878,27 @@ def clean_html(text: str) -> tuple[str, list[str]]:
 
     out = _META_TAG_RE.sub(_meta_sub, text)
 
-    def _jsonld_is_ai(blob: str) -> bool:
+    def _block_is_ai(open_tag: str, blob: str) -> bool:
+        if not _script_tag_is_jsonld(open_tag):
+            return False
         return AI_META_NAME_RE.search(blob) or re.search(
             r"DigitalSourceType|trainedAlgorithmicMedia|SoftwareAgent", blob, re.I
         )
 
-    new, n = _drop_blocks_if(out, _JSONLD_OPEN_RE, _JSONLD_CLOSE_RE, _jsonld_is_ai)
+    kept = []
+    last = 0
+    n = 0
+    for os_, oe, _cs, ce in _iter_script_blocks(out):
+        blob = out[os_:ce]
+        if not _block_is_ai(out[os_:oe], blob):
+            continue
+        kept.append(out[last:os_])
+        last = ce
+        n += 1
     if n:
+        kept.append(out[last:])
+        out = "".join(kept)
         actions.extend(["drop json-ld provenance-like script"] * n)
-        out = new
     out2, n = re.subn(r"\sdata-ai[\w-]*\s*=\s*[\"'][^\"']*[\"']", "", out, flags=re.I)
     if n:
         actions.append(f"drop data-ai* attributes x{n}")
@@ -707,7 +957,217 @@ def inspect_svg(data: bytes) -> tuple[bool, bool, list[str], dict]:
     return has_c2pa, has_ai or has_c2pa, findings, {}
 
 
+_XML_DECL_KEYWORDS = ("doctype", "entity")
+
+
+def _xml_decl_keyword(text: str, i: int) -> str | None:
+    """Return "doctype"/"entity" if text[i:] opens that declaration, else None."""
+    if text[i : i + 2] != "<!":
+        return None
+    rest = text[i + 2 :]
+    for kw in _XML_DECL_KEYWORDS:
+        if rest.lower().startswith(kw):
+            # Require a word boundary so names like <!DOCTYPEfoo> aren't matched.
+            nxt = rest[len(kw) : len(kw) + 1]
+            if nxt and (nxt.isalnum() or nxt in "_:"):
+                return None
+            return kw
+    return None
+
+
+def _xml_decl_end(text: str, i: int, keyword: str) -> int:
+    """Return the index just past a declaration's closing '>', or -1 if unterminated.
+
+    Quotes and the internal subset are respected, so a '>' inside a quoted
+    external identifier or a nested internal subset does not end the
+    declaration early.
+    """
+    j = i + 2 + len(keyword)
+    n = len(text)
+    quote: str | None = None
+    subset_depth = 0
+    while j < n:
+        c = text[j]
+        if quote is not None:
+            # Line breaks are legal inside quoted system/public literals and
+            # entity values, so they don't terminate the declaration; the first
+            # unquoted '>' ends it.
+            if c == quote:
+                quote = None
+            j += 1
+            continue
+        # DTD comments inside the internal subset must not affect subset_depth
+        # or look like a close, so skip them whole.
+        if text.startswith("<!--", j):
+            end = text.find("-->", j)
+            if end == -1:
+                return -1
+            j = end + 3
+            continue
+        if c in "\"'":
+            quote = c
+            j += 1
+            continue
+        if c == "[":
+            subset_depth += 1
+            j += 1
+            continue
+        if c == "]":
+            if subset_depth:
+                subset_depth -= 1
+            j += 1
+            continue
+        if c == ">" and subset_depth == 0:
+            return j + 1
+        j += 1
+    return -1
+
+
+def _strip_xml_declarations(text: str) -> tuple[str, int]:
+    """Remove top-level <!DOCTYPE ...> and <!ENTITY ...> declarations.
+
+    Only declarations in markup context are stripped, so matching text inside
+    CDATA sections, comments, and quoted attribute values (which do not start a
+    declaration) is preserved. A declaration is consumed through its true
+    terminator: quoted external identifiers and the internal subset, including
+    nested brackets and embedded '>' characters, are respected. An unterminated
+    declaration is left intact rather than partially deleted.
+    """
+    i = 0
+    n = len(text)
+    out: list[str] = []
+    removed = 0
+    in_tag = False
+    quote: str | None = None
+    while i < n:
+        c = text[i]
+        if in_tag:
+            if quote is not None:
+                out.append(c)
+                if c == quote:
+                    quote = None
+            elif c in "\"'":
+                quote = c
+                out.append(c)
+            elif c == ">":
+                in_tag = False
+                out.append(c)
+            else:
+                out.append(c)
+            i += 1
+            continue
+        if text.startswith("<![CDATA[", i):
+            end = text.find("]]>", i)
+            if end == -1:
+                out.append(text[i:])
+                break
+            out.append(text[i : end + 3])
+            i = end + 3
+            continue
+        if text.startswith("<!--", i):
+            end = text.find("-->", i)
+            if end == -1:
+                out.append(text[i:])
+                break
+            out.append(text[i : end + 3])
+            i = end + 3
+            continue
+        keyword = _xml_decl_keyword(text, i)
+        if keyword:
+            end = _xml_decl_end(text, i, keyword)
+            if end == -1:
+                out.append(c)
+                i += 1
+                continue
+            removed += 1
+            i = end
+            continue
+        out.append(c)
+        if c == "<":
+            in_tag = True
+        i += 1
+    return "".join(out), removed
+
+
+def _strip_root_svg_attrs(text: str) -> tuple[str, int]:
+    """Remove provenance attributes from the root <svg ...> start tag only.
+
+    The attribute substitution runs on the parsed root start tag so matching
+    text in CDATA, comments, or text content is untouched. Both single- and
+    double-quoted attribute values are supported.
+    """
+    n = len(text)
+    i = 0
+    start = -1
+    while i < n:
+        if text.startswith("<![CDATA[", i):
+            end = text.find("]]>", i)
+            if end == -1:
+                return text, 0
+            i = end + 3
+            continue
+        if text.startswith("<!--", i):
+            end = text.find("-->", i)
+            if end == -1:
+                return text, 0
+            i = end + 3
+            continue
+        if text.startswith("<?", i):
+            # A processing instruction may contain "<svg"; skip it so the root
+            # element start tag is what gets cleaned.
+            end = text.find("?>", i)
+            if end == -1:
+                return text, 0
+            i = end + 2
+            continue
+        if text[i : i + 4].lower() == "<svg":
+            nxt = text[i + 4 : i + 5]
+            if not (nxt and (nxt.isalnum() or nxt in "_:.-")):
+                start = i
+                break
+        i += 1
+    if start == -1:
+        return text, 0
+    # Find the quote-aware '>' that closes the start tag.
+    j = start + 4
+    quote: str | None = None
+    while j < n:
+        c = text[j]
+        if quote is not None:
+            if c == quote:
+                quote = None
+            j += 1
+            continue
+        if c in "\"'":
+            quote = c
+            j += 1
+            continue
+        if c == ">":
+            break
+        j += 1
+    else:
+        return text, 0  # unclosed start tag; leave as-is
+    tag = text[start : j + 1]
+    new_tag, cnt = re.subn(
+        r'\s(?:inkscape:version|sodipodi:docname|generator)\s*=\s*("[^"]*"|\'[^\']*\')',
+        "",
+        tag,
+        flags=re.I,
+    )
+    if not cnt:
+        return text, 0
+    return text[:start] + new_tag + text[j + 1 :], cnt
+
+
 def clean_svg(data: bytes) -> tuple[bytes, list[str]]:
+    """Strip AI provenance metadata from SVG content, returning (bytes, actions).
+
+    Removes <metadata>/<xmpmeta> blocks, XML DOCTYPE and ENTITY declarations,
+    AI-marker comments, and embedded data URIs, and drops generator-like
+    attributes on the root element. Declaration stripping is context-aware so
+    the document body, CDATA sections, comments, and quoted attribute values are
+    preserved.
+    """
     actions: list[str] = []
     text = data.decode("utf-8", errors="surrogateescape")
     # Drop metadata blocks (linear scan - lazy .*? is quadratic on unclosed tags)
@@ -720,6 +1180,11 @@ def clean_svg(data: bytes) -> tuple[bytes, list[str]]:
     if n:
         actions.append(f"drop xmpmeta x{n}")
         text = new
+
+    # Drop XML DOCTYPE and ENTITY declarations (context-aware)
+    text, decl_count = _strip_xml_declarations(text)
+    if decl_count:
+        actions.append(f"drop DOCTYPE/entity declarations x{decl_count}")
 
     # Drop comments that look like provenance (linear scan)
     def _cmt(block: str) -> bool:
@@ -735,17 +1200,12 @@ def clean_svg(data: bytes) -> tuple[bytes, list[str]]:
     if uri_actions:
         actions.extend(uri_actions)
 
-    if not actions:
-        # still strip generator attribute on root if present
-        new, n = re.subn(
-            r'\s(inkscape:version|sodipodi:docname|generator)\s*=\s*"[^"]*"',
-            "",
-            text,
-            flags=re.I,
-        )
-        if n:
-            actions.append(f"drop generator-like attrs x{n}")
-            text = new
+    # Strip generator-like attributes on the root <svg> start tag independently
+    # of the actions above, so they are removed whenever present (not only when
+    # nothing else needed cleaning).
+    text, n = _strip_root_svg_attrs(text)
+    if n:
+        actions.append(f"drop generator-like attrs x{n}")
     if not actions:
         actions.append("no SVG metadata removed")
     return text.encode("utf-8", errors="surrogateescape"), actions
@@ -773,7 +1233,9 @@ DOCX_CUSTOM_PREFIXES = (
 
 # Provenance fields in docProps/core.xml and docProps/app.xml that always come
 # out empty. dc:title is deliberately not listed: it is the document's own
-# heading, not provenance.
+# heading, not provenance. AppVersion is also excluded: ECMA-376 Part 1
+# §15.2.12.1 requires AppVersion to match \d+\.\d{4} when present, so blanking it
+# produces schema-invalid XML that Word/Office rejects with unreadable content (#283).
 DOCX_SCRUB_FIELDS = (
     ("dc:creator", "dc:creator"),
     ("cp:lastModifiedBy", "cp:lastModifiedBy"),
@@ -782,7 +1244,6 @@ DOCX_SCRUB_FIELDS = (
     ("dc:subject", "dc:subject"),
     ("cp:category", "cp:category"),
     ("Application", "Application"),
-    ("AppVersion", "AppVersion"),
     ("Company", "Company"),
     ("Manager", "Manager"),
 )
@@ -791,52 +1252,6 @@ DOCX_SCRUB_FIELDS = (
 def _zip_namelist(data: bytes) -> list[str]:
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
         return zf.namelist()
-
-
-MAX_ZIP_DECOMPRESSED_BYTES = 128 * 1024 * 1024
-
-
-def _check_zip_budget(info: zipfile.ZipInfo, budget: list[int]) -> None:
-    """Fast-path zip-bomb guard on the declared member size.
-
-    A single member whose *declared* size already exceeds the cap is
-    rejected before any decompression. The authoritative accounting lives in
-    _read_zip_member, which charges **actual** decompressed bytes to the
-    shared budget: ZipInfo.file_size comes from the archive central
-    directory and is attacker-controlled, so trusting it for the cumulative
-    limit would let a crafted archive declare a tiny size and still expand
-    to gigabytes.
-    """
-    if info.file_size > MAX_ZIP_DECOMPRESSED_BYTES:
-        raise ZipBudgetExceeded(
-            "zip decompressed size exceeds cap "
-            f"({MAX_ZIP_DECOMPRESSED_BYTES} bytes); refusing to process"
-        )
-
-
-def _read_zip_member(zf: zipfile.ZipFile, info: zipfile.ZipInfo, budget: list[int]) -> bytes:
-    """Read one zip member, charging real decompressed bytes to the budget.
-
-    Streams the member in chunks so the cumulative cap is enforced on bytes
-    actually produced, not on the declared ``file_size``; raises
-    ``ZipBudgetExceeded`` the moment the cap is crossed, before the whole
-    member is buffered.
-    """
-    _check_zip_budget(info, budget)
-    with zf.open(info) as stream:
-        chunks: list[bytes] = []
-        while True:
-            chunk = stream.read(1 << 16)
-            if not chunk:
-                break
-            budget[0] += len(chunk)
-            if budget[0] > MAX_ZIP_DECOMPRESSED_BYTES:
-                raise ZipBudgetExceeded(
-                    "zip decompressed size exceeds cap "
-                    f"({MAX_ZIP_DECOMPRESSED_BYTES} bytes); refusing to process"
-                )
-            chunks.append(chunk)
-    return b"".join(chunks)
 
 
 def _is_docx_meta_part(name: str) -> bool:
@@ -972,7 +1387,11 @@ def _reencode_xml_text(s: str) -> str:
 
 
 def _scrub_text_runs(
-    xml_text: str, open_re: re.Pattern[str], close_re: re.Pattern[str]
+    xml_text: str,
+    open_re: re.Pattern[str],
+    close_re: re.Pattern[str],
+    *,
+    normalize_spaces: bool = True,
 ) -> tuple[str, int, int]:
     """Run Layer A over the text runs delimited by open_re/close_re.
 
@@ -996,7 +1415,9 @@ def _scrub_text_runs(
         open_tag = xml_text[os_:oe]
         inner = xml_text[oe:cs_]
         close_tag = xml_text[cs_:ce]
-        new_inner, stats = clean_text(_decode_xml_entities(inner))
+        new_inner, stats = clean_text(
+            _decode_xml_entities(inner), normalize_spaces=normalize_spaces
+        )
         if not (stats["removed_count"] or stats["replaced_count"]):
             continue
         removed += stats["removed_count"]
@@ -1010,7 +1431,7 @@ def _scrub_text_runs(
     return "".join(out), removed, replaced
 
 
-def _scrub_docx_text(xml_text: str) -> tuple[str, int, int]:
+def _scrub_docx_text(xml_text: str, *, normalize_spaces: bool = True) -> tuple[str, int, int]:
     """Run Layer A over the ``<w:t>`` text runs of a DOCX part.
 
     Only ``w:t`` nodes are touched: field codes (``w:instrText``), run/paragraph
@@ -1018,20 +1439,32 @@ def _scrub_docx_text(xml_text: str) -> tuple[str, int, int]:
     trailing whitespace survives the clean, the node keeps
     ``xml:space="preserve"`` so Word does not trim it.
     """
-    return _scrub_text_runs(xml_text, re.compile(r"<w:t\b[^>]*>"), re.compile(r"</w:t>"))
+    return _scrub_text_runs(
+        xml_text,
+        re.compile(r"<w:t\b[^>]*>"),
+        re.compile(r"</w:t>"),
+        normalize_spaces=normalize_spaces,
+    )
 
 
-def _scrub_xlsx_text(xml_text: str) -> tuple[str, int, int]:
+def _scrub_xlsx_text(xml_text: str, *, normalize_spaces: bool = True) -> tuple[str, int, int]:
     """Run Layer A over the ``<t>`` text elements of an XLSX part."""
-    return _scrub_text_runs(xml_text, re.compile(r"<t\b[^>]*>"), re.compile(r"</t>"))
+    return _scrub_text_runs(
+        xml_text, re.compile(r"<t\b[^>]*>"), re.compile(r"</t>"), normalize_spaces=normalize_spaces
+    )
 
 
-def _scrub_pptx_text(xml_text: str) -> tuple[str, int, int]:
+def _scrub_pptx_text(xml_text: str, *, normalize_spaces: bool = True) -> tuple[str, int, int]:
     """Run Layer A over the ``<a:t>`` text elements of a PPTX part."""
-    return _scrub_text_runs(xml_text, re.compile(r"<a:t\b[^>]*>"), re.compile(r"</a:t>"))
+    return _scrub_text_runs(
+        xml_text,
+        re.compile(r"<a:t\b[^>]*>"),
+        re.compile(r"</a:t>"),
+        normalize_spaces=normalize_spaces,
+    )
 
 
-def _scrub_odt_text(xml_text: str) -> tuple[str, int, int]:
+def _scrub_odt_text(xml_text: str, *, normalize_spaces: bool = True) -> tuple[str, int, int]:
     """Run Layer A over ODF paragraph text (``text:p`` content, incl. spans).
 
     ``text:span``/``text:tab``/``text:s`` children live inside the paragraph,
@@ -1059,7 +1492,9 @@ def _scrub_odt_text(xml_text: str) -> tuple[str, int, int]:
             if not segment or segment.startswith("<"):
                 new_parts.append(segment)
                 continue
-            new_segment, stats = clean_text(_decode_xml_entities(segment))
+            new_segment, stats = clean_text(
+                _decode_xml_entities(segment), normalize_spaces=normalize_spaces
+            )
             if stats["removed_count"] or stats["replaced_count"]:
                 removed += stats["removed_count"]
                 replaced += stats["replaced_count"]
@@ -1202,7 +1637,7 @@ def _prune_opf_manifest(raw: bytes, opf_name: str, dropped: set[str]) -> tuple[b
 
 
 def _scrub_ooxml_zip(
-    data: bytes, fmt: str, *, also_layer_a_text: bool = True
+    data: bytes, fmt: str, *, also_layer_a_text: bool = True, normalize_spaces: bool = True
 ) -> tuple[bytes, list[str]]:
     actions: list[str] = []
     budget = [0]
@@ -1305,21 +1740,21 @@ def _scrub_ooxml_zip(
             if also_layer_a_text and name.endswith(".xml"):
                 if fmt == "docx" and name.startswith("word/"):
                     text = raw.decode("utf-8", errors="replace")
-                    new, r, rp = _scrub_docx_text(text)
+                    new, r, rp = _scrub_docx_text(text, normalize_spaces=normalize_spaces)
                     if r or rp:
                         layer_removed += r
                         layer_replaced += rp
                         raw = new.encode("utf-8")
                 elif fmt == "xlsx" and name.startswith("xl/"):
                     text = raw.decode("utf-8", errors="replace")
-                    new, r, rp = _scrub_xlsx_text(text)
+                    new, r, rp = _scrub_xlsx_text(text, normalize_spaces=normalize_spaces)
                     if r or rp:
                         layer_removed += r
                         layer_replaced += rp
                         raw = new.encode("utf-8")
                 elif fmt == "pptx" and name.startswith("ppt/"):
                     text = raw.decode("utf-8", errors="replace")
-                    new, r, rp = _scrub_pptx_text(text)
+                    new, r, rp = _scrub_pptx_text(text, normalize_spaces=normalize_spaces)
                     if r or rp:
                         layer_removed += r
                         layer_replaced += rp
@@ -1348,16 +1783,37 @@ def _scrub_ooxml_zip(
     return out_buf.getvalue(), actions
 
 
-def clean_docx(data: bytes, *, also_layer_a_text: bool = True) -> tuple[bytes, list[str]]:
-    return _scrub_ooxml_zip(data, "docx", also_layer_a_text=also_layer_a_text)
+def clean_docx(
+    data: bytes, *, also_layer_a_text: bool = True, normalize_spaces: bool = True
+) -> tuple[bytes, list[str]]:
+    return _scrub_ooxml_zip(
+        data,
+        "docx",
+        also_layer_a_text=also_layer_a_text,
+        normalize_spaces=normalize_spaces,
+    )
 
 
-def clean_xlsx(data: bytes, *, also_layer_a_text: bool = True) -> tuple[bytes, list[str]]:
-    return _scrub_ooxml_zip(data, "xlsx", also_layer_a_text=also_layer_a_text)
+def clean_xlsx(
+    data: bytes, *, also_layer_a_text: bool = True, normalize_spaces: bool = True
+) -> tuple[bytes, list[str]]:
+    return _scrub_ooxml_zip(
+        data,
+        "xlsx",
+        also_layer_a_text=also_layer_a_text,
+        normalize_spaces=normalize_spaces,
+    )
 
 
-def clean_pptx(data: bytes, *, also_layer_a_text: bool = True) -> tuple[bytes, list[str]]:
-    return _scrub_ooxml_zip(data, "pptx", also_layer_a_text=also_layer_a_text)
+def clean_pptx(
+    data: bytes, *, also_layer_a_text: bool = True, normalize_spaces: bool = True
+) -> tuple[bytes, list[str]]:
+    return _scrub_ooxml_zip(
+        data,
+        "pptx",
+        also_layer_a_text=also_layer_a_text,
+        normalize_spaces=normalize_spaces,
+    )
 
 
 def inspect_odt(data: bytes) -> tuple[bool, bool, list[str], dict]:
@@ -1395,7 +1851,9 @@ def inspect_odt(data: bytes) -> tuple[bool, bool, list[str], dict]:
     return has_c2pa, has_ai or has_c2pa, findings, {}
 
 
-def clean_odt(data: bytes, *, also_layer_a_text: bool = True) -> tuple[bytes, list[str]]:
+def clean_odt(
+    data: bytes, *, also_layer_a_text: bool = True, normalize_spaces: bool = True
+) -> tuple[bytes, list[str]]:
     actions: list[str] = []
     budget = [0]
     layer_removed = 0
@@ -1441,7 +1899,7 @@ def clean_odt(data: bytes, *, also_layer_a_text: bool = True) -> tuple[bytes, li
             # Layer A over the visible paragraph text of the body part.
             if also_layer_a_text and name == "content.xml":
                 text = raw.decode("utf-8", errors="replace")
-                new, r, rp = _scrub_odt_text(text)
+                new, r, rp = _scrub_odt_text(text, normalize_spaces=normalize_spaces)
                 if r or rp:
                     layer_removed += r
                     layer_replaced += rp
@@ -1663,7 +2121,9 @@ def _scrub_epub_opf(text: str) -> tuple[str, list[str]]:
     return new, actions
 
 
-def clean_epub(data: bytes, *, also_layer_a_text: bool = True) -> tuple[bytes, list[str]]:
+def clean_epub(
+    data: bytes, *, also_layer_a_text: bool = True, normalize_spaces: bool = True
+) -> tuple[bytes, list[str]]:
     """Rewrite the EPUB: scrub OPF metadata, XHTML meta/JSON-LD, and Layer A.
 
     Embedded raster/SVG media get their own metadata stripped; structural and
@@ -1732,7 +2192,7 @@ def clean_epub(data: bytes, *, also_layer_a_text: bool = True) -> tuple[bytes, l
                 if sub_actions and sub_actions != ["no HTML AI meta removed"]:
                     actions.append(f"{name}: {', '.join(sub_actions[:2])}")
                 if also_layer_a_text:
-                    text2, stats = clean_text(text)
+                    text2, stats = clean_text(text, normalize_spaces=normalize_spaces)
                     if stats["removed_count"] or stats["replaced_count"]:
                         layer_removed += stats["removed_count"]
                         layer_replaced += stats["replaced_count"]
@@ -2066,11 +2526,11 @@ def which_ghostscript() -> str | None:
 
 def _exiftool_strip(
     exiftool: str, dest: Path, actions: list[str], deadline: "_Deadline | None" = None
-) -> None:
+) -> bool:
     """Run ``exiftool -all=`` over *dest* in place, recording the outcome."""
     if deadline is not None and deadline.spent():
         actions.append("exiftool skipped: clean budget exhausted")
-        return
+        return False
     try:
         r = subprocess.run(
             [exiftool, "-all=", "-overwrite_original", safe_arg(str(dest))],
@@ -2084,8 +2544,10 @@ def _exiftool_strip(
             creationflags=subprocess_creationflags,
         )
         actions.append(f"exiftool -all= (rc={r.returncode})")
+        return r.returncode == 0
     except Exception as e:
         actions.append(f"exiftool failed: {e}")
+        return False
 
 
 def _pdf_deep_image_clean(
@@ -2222,34 +2684,44 @@ def clean_pdf(path: Path, dest: Path, *, deep_images: str = "auto") -> tuple[lis
     exiftool = which("exiftool")
     rewritten = False
 
+    def _stdlib_document_strip(source: bytes) -> str:
+        """Apply the byte-preserving fallback and return its reported mode."""
+        blanked, n = _blank_xmp_packets(source)
+        safe_write_bytes(dest, blanked if n else source)
+        if n:
+            actions.append(f"blanked XMP xpacket x{n} (degraded; byte offsets preserved)")
+            actions.append("warning: pure-stdlib PDF strip is best-effort; prefer exiftool")
+            return "stdlib-xmp"
+        actions.append(
+            "no PDF cleaner available (install exiftool for reliable metadata "
+            "strip); document-level metadata left as-is"
+        )
+        return "copy"
+
     if exiftool:
         safe_write_bytes(dest, data)
-        _exiftool_strip(exiftool, dest, actions, deadline)
-        # exiftool writes PDFs *incrementally*: it appends a
-        # %BeginExifToolUpdate block that frees the Info object and drops
-        # /Info from the trailer, but the original metadata bytes stay in the
-        # file verbatim and are trivially recoverable (exiftool itself can
-        # revert them with -PDF-update:all=). A structural rewrite is what
-        # actually drops the now-unreferenced objects.
-        rewritten = _pdf_structural_rewrite(dest, actions, deadline)
-        document_mode = "exiftool"
+        if not _exiftool_strip(exiftool, dest, actions, deadline):
+            # An installed exiftool can still reject malformed or unsupported
+            # PDFs. Fall back to the same byte-preserving XMP scrub as the
+            # no-exiftool path, and report the result as degraded instead of
+            # claiming the optional cleaner completed.
+            document_mode = _stdlib_document_strip(data)
+            exiftool = None
+        else:
+            # exiftool writes PDFs *incrementally*: it appends a
+            # %BeginExifToolUpdate block that frees the Info object and drops
+            # /Info from the trailer, but the original metadata bytes stay in the
+            # file verbatim and are trivially recoverable (exiftool itself can
+            # revert them with -PDF-update:all=). A structural rewrite is what
+            # actually drops the now-unreferenced objects.
+            rewritten = _pdf_structural_rewrite(dest, actions, deadline)
+            document_mode = "exiftool"
     else:
         # Degraded document-level strip: obvious XMP packets and nothing else.
         # The deep-image ladder below still runs -- Ghostscript reaches metadata
         # inside image XObjects on its own, and gating that on exiftool left the
         # only tool that can do that job unused.
-        blanked, n = _blank_xmp_packets(data)
-        safe_write_bytes(dest, blanked if n else data)
-        if n:
-            actions.append(f"blanked XMP xpacket x{n} (degraded; byte offsets preserved)")
-            actions.append("warning: pure-stdlib PDF strip is best-effort; prefer exiftool")
-            document_mode = "stdlib-xmp"
-        else:
-            actions.append(
-                "no PDF cleaner available (install exiftool for reliable metadata "
-                "strip); document-level metadata left as-is"
-            )
-            document_mode = "copy"
+        document_mode = _stdlib_document_strip(data)
 
     # Document-level strip is done. Metadata inside embedded images is out
     # of reach from here, so decide whether to re-distill.
@@ -2266,12 +2738,17 @@ def clean_pdf(path: Path, dest: Path, *, deep_images: str = "auto") -> tuple[lis
     def _settle(ran: bool) -> None:
         # pdfwrite stamps its own /Producer, and exiftool edits PDFs
         # incrementally, so re-serialize once more after removing it.
-        nonlocal rewritten
+        nonlocal document_mode, exiftool, rewritten
         if not ran:
             return
         if exiftool:
-            _exiftool_strip(exiftool, dest, actions, deadline)
-            rewritten = _pdf_structural_rewrite(dest, actions, deadline) or rewritten
+            current = dest.read_bytes()
+            if _exiftool_strip(exiftool, dest, actions, deadline):
+                rewritten = _pdf_structural_rewrite(dest, actions, deadline) or rewritten
+            else:
+                document_mode = _stdlib_document_strip(current)
+                exiftool = None
+                rewritten = False
         else:
             # Trading a vendor mark for a Ghostscript one is still worth it,
             # but the caller should not have to discover the swap.
@@ -2349,8 +2826,9 @@ def clean_pdf(path: Path, dest: Path, *, deep_images: str = "auto") -> tuple[lis
 # ---------------------------------------------------------------------------
 
 
-def inspect_container(path: Path) -> ContainerInspectReport:
-    data = path.read_bytes()
+def inspect_container(path: Path, *, data: bytes | None = None) -> ContainerInspectReport:
+    if data is None:
+        data = path.read_bytes()
     fmt = detect_container_format(path, data)
     tools: dict[str, Any] = {}
     details: dict[str, Any] = {}
@@ -2463,6 +2941,7 @@ def clean_container(
     *,
     also_layer_a_text: bool = True,
     deep_images: str = "auto",
+    normalize_spaces: bool = True,
 ) -> dict[str, Any]:
     """Clean container metadata; optionally Layer-A scrub text bodies for md/html.
 
@@ -2486,25 +2965,35 @@ def clean_container(
         actions, meta_extra = clean_pdf(path, dest, deep_images=deep_images)
         meta.update(meta_extra)
     elif fmt == "docx":
-        cleaned, actions = clean_docx(data, also_layer_a_text=also_layer_a_text)
+        cleaned, actions = clean_docx(
+            data, also_layer_a_text=also_layer_a_text, normalize_spaces=normalize_spaces
+        )
         safe_write_bytes(dest, cleaned)
     elif fmt == "xlsx":
-        cleaned, actions = clean_xlsx(data, also_layer_a_text=also_layer_a_text)
+        cleaned, actions = clean_xlsx(
+            data, also_layer_a_text=also_layer_a_text, normalize_spaces=normalize_spaces
+        )
         safe_write_bytes(dest, cleaned)
     elif fmt == "pptx":
-        cleaned, actions = clean_pptx(data, also_layer_a_text=also_layer_a_text)
+        cleaned, actions = clean_pptx(
+            data, also_layer_a_text=also_layer_a_text, normalize_spaces=normalize_spaces
+        )
         safe_write_bytes(dest, cleaned)
     elif fmt == "odt":
-        cleaned, actions = clean_odt(data, also_layer_a_text=also_layer_a_text)
+        cleaned, actions = clean_odt(
+            data, also_layer_a_text=also_layer_a_text, normalize_spaces=normalize_spaces
+        )
         safe_write_bytes(dest, cleaned)
     elif fmt == "epub":
-        cleaned, actions = clean_epub(data, also_layer_a_text=also_layer_a_text)
+        cleaned, actions = clean_epub(
+            data, also_layer_a_text=also_layer_a_text, normalize_spaces=normalize_spaces
+        )
         safe_write_bytes(dest, cleaned)
     elif fmt == "html":
         text = data.decode("utf-8", errors="surrogateescape")
         text, actions = clean_html(text)
         if also_layer_a_text:
-            text2, stats = clean_text(text)
+            text2, stats = clean_text(text, normalize_spaces=normalize_spaces)
             if stats["removed_count"] or stats["replaced_count"]:
                 actions.append(
                     f"layer A text: removed={stats['removed_count']} replaced={stats['replaced_count']}"
@@ -2515,7 +3004,7 @@ def clean_container(
         text = data.decode("utf-8", errors="surrogateescape")
         text, actions = clean_markdown(text)
         if also_layer_a_text:
-            text2, stats = clean_text(text)
+            text2, stats = clean_text(text, normalize_spaces=normalize_spaces)
             if stats["removed_count"] or stats["replaced_count"]:
                 actions.append(
                     f"layer A text: removed={stats['removed_count']} replaced={stats['replaced_count']}"
