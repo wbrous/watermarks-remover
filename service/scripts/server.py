@@ -12,14 +12,18 @@ Endpoints:
     POST /detect         -> {"file": <base64>, "name": "x.txt"} -> watermark detector reports
     POST /clean          -> {"file": <base64>, "name": "x.png", "options": {...}}
                          -> {"cleaned": <base64>, "report": {...}}
+    POST /watermark      -> {"text": str, "keys": list[int], "options": {...}}
+                         -> {"ok": true, "kind": "text", "watermarked_text": str, "report": {...}}
     POST /inspect/batch  -> {"files": [{"file": <base64>, "name": "x.png"}, ...]}
                          -> {"results": [{"name", "ok", "kind", "report", "suspicious"}, ...]}
     POST /detect/batch   -> {"files": [{"file": <base64>, "name": "x.txt"}, ...]}
                          -> {"results": [{"name", "ok", "kind", "detections", "report"}, ...]}
     POST /clean/batch    -> {"files": [{"file": <base64>, "name": "x.png", "options": {...}}, ...]}
                          -> {"results": [{"name", "ok", "kind", "cleaned", "report"}, ...]}
+    POST /watermark/batch -> {"files": [{"text": str, "keys": list[int], ...}, ...]}
+                         -> {"results": [{"name", "ok", "kind", "watermarked_text", "report"}, ...]}
 
-Batch endpoints loop the same single-file pipeline as /inspect, /detect, and /clean; a
+Batch endpoints loop the same single-file pipeline as /inspect, /detect, /clean, and /watermark; a
 per-file failure (unknown format, oversized name, bad option) shows up as
 that entry's "ok": false with an "error" string and never aborts the rest of
 the batch. Capped at WATERMARKS_MAX_BATCH_FILES entries per request (default
@@ -42,6 +46,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.error
 from datetime import datetime
 from functools import cache
 from http import HTTPStatus
@@ -69,6 +75,11 @@ from image_meta import clean_image, inspect_image, run_synthid_score, synthid_is
 from score_stylometry import score_text_stylometry
 from text_detectors import detector_status, run_all_text_detectors, run_text_detectors
 from text_unicode import clean_text, inspect_text
+from text_watermark import (
+    generate_watermark_text,
+    parse_watermark_options,
+    resolve_timeout,
+)
 
 VERSION = os.environ.get("WATERMARKS_SERVER_VERSION", "dev")
 
@@ -98,7 +109,12 @@ ALLOWED_CLEAN_OPTIONS = {
     "detect_after": bool,
     "deep_images": str,
     "style": str,
+    "strategy": str,
 }
+
+# Default Layer B strategy loaded from the strategy config file (overridable by
+# env/CLI). None means no Layer B rewrite on text.
+_DEFAULT_STRATEGY: str | None = None
 
 
 @cache
@@ -193,6 +209,10 @@ def capabilities() -> dict[str, Any]:
             "stylometry": True,
         },
         "text_detectors": detector_status(),
+        "text_generators": {
+            "synthid_http": bool(os.environ.get("WATERMARKS_SYNTHID_TEXT_URL")),
+            "markllm": bool(os.environ.get("MARKLLM_DIR")),
+        },
         "harnesses": {
             "markllm": bool(os.environ.get("MARKLLM_DIR")),
         },
@@ -337,6 +357,96 @@ def _clean_request_schema() -> dict[str, Any]:
     )
 
 
+def _watermark_error_status(res: dict[str, Any]) -> HTTPStatus:
+    """Map a watermark failure result to the correct HTTP status.
+
+    Uses the stable ``error_code`` field returned by the text_watermark
+    client rather than fragile substring-matching on the human-readable
+    ``error`` message.
+    """
+    _ERROR_CODE_MAP: dict[str, HTTPStatus] = {
+        "unconfigured": HTTPStatus.SERVICE_UNAVAILABLE,
+        "auth": HTTPStatus.BAD_GATEWAY,
+        "client_error": HTTPStatus.BAD_REQUEST,
+        "unreachable": HTTPStatus.BAD_GATEWAY,
+        "backend_error": HTTPStatus.BAD_GATEWAY,
+        "timeout": HTTPStatus.BAD_GATEWAY,
+        "ssrf": HTTPStatus.BAD_GATEWAY,
+    }
+    code = res.get("error_code", "")
+    if code in _ERROR_CODE_MAP:
+        return _ERROR_CODE_MAP[code]
+    # Fallback for any result that pre-dates the error_code field.
+    return HTTPStatus.BAD_REQUEST
+
+
+def _watermark_request_schema() -> dict[str, Any]:
+    return _schema(
+        type="object",
+        additionalProperties=False,
+        properties={
+            "text": _schema(type="string", description="Prompt or text to watermark"),
+            "file": _schema(type="string", description="Base64-encoded text file"),
+            "name": _schema(type="string", description="Optional filename"),
+            "keys": _schema(
+                type="array",
+                items=_schema(type="integer"),
+                description="Optional SynthID key sequence",
+            ),
+            "options": _schema(
+                type="object",
+                additionalProperties=False,
+                properties={
+                    "scheme": _schema(type="string", default="synthid"),
+                    "seed": _schema(type="integer"),
+                    "max_new_tokens": _schema(
+                        type="integer",
+                        default=200,
+                        minimum=1,
+                        maximum=8192,
+                    ),
+                    "min_length": _schema(
+                        type="integer",
+                        default=0,
+                        minimum=0,
+                        maximum=8192,
+                    ),
+                    "temperature": _schema(
+                        type="number",
+                        minimum=0,
+                        exclusiveMinimum=True,
+                    ),
+                    "top_p": _schema(
+                        type="number",
+                        minimum=0,
+                        exclusiveMinimum=True,
+                        maximum=1,
+                    ),
+                    "model": _schema(type="string"),
+                    "device": _schema(
+                        type="string",
+                        description="Inference device (e.g. 'cpu', 'cuda', 'cuda:0')",
+                    ),
+                    "config": _schema(
+                        type="string",
+                        description="Path to a custom watermark config file",
+                    ),
+                    "offline": _schema(
+                        type="boolean",
+                        default=False,
+                        description="If true, disable network access for model loading",
+                    ),
+                },
+            ),
+        },
+    )
+
+
+_ERROR_SCHEMA = _schema(
+    type="object",
+    properties={"ok": _schema(type="boolean", enum=[False]), "error": _schema(type="string")},
+)
+
 _OPENAPI_PATHS: dict[str, dict[str, Any]] = {
     "/health": {
         "get": {
@@ -385,6 +495,13 @@ _OPENAPI_PATHS: dict[str, dict[str, Any]] = {
                         "text_detectors": _schema(
                             type="object",
                             additionalProperties=_schema(type="boolean"),
+                        ),
+                        "text_generators": _schema(
+                            type="object",
+                            properties={
+                                "synthid_http": _schema(type="boolean"),
+                                "markllm": _schema(type="boolean"),
+                            },
                         ),
                     },
                 )
@@ -607,12 +724,80 @@ _OPENAPI_PATHS: dict[str, dict[str, Any]] = {
             },
         }
     },
+    "/watermark": {
+        "post": {
+            "summary": "Generate watermarked text using the configured sidecar or generator",
+            "requestBody": _schema(
+                required=True,
+                content={"application/json": _schema(schema=_watermark_request_schema())},
+            ),
+            "responses": {
+                "200": _schema(
+                    type="object",
+                    properties={
+                        "ok": _schema(type="boolean"),
+                        "kind": _schema(type="string", enum=["text"]),
+                        "watermarked_text": _schema(type="string"),
+                        "report": _schema(type="object"),
+                    },
+                ),
+                "502": {
+                    "description": "Sidecar / MarkLLM backend error",
+                    "content": {"application/json": {"schema": _ERROR_SCHEMA}},
+                },
+                "503": {
+                    "description": "No text watermark generator configured",
+                    "content": {"application/json": {"schema": _ERROR_SCHEMA}},
+                },
+            },
+        }
+    },
+    "/watermark/batch": {
+        "post": {
+            "summary": f"Generate watermarked text for up to {MAX_BATCH_FILES} files in one request",
+            "requestBody": _schema(
+                required=True,
+                content={
+                    "application/json": _schema(
+                        schema=_schema(
+                            type="object",
+                            required=["files"],
+                            properties={
+                                "files": _schema(
+                                    type="array",
+                                    items=_watermark_request_schema(),
+                                )
+                            },
+                        )
+                    )
+                },
+            ),
+            "responses": {
+                "200": _schema(
+                    type="object",
+                    properties={
+                        "ok": _schema(type="boolean"),
+                        "results": _schema(
+                            type="array",
+                            items=_schema(
+                                type="object",
+                                properties={
+                                    "name": _schema(type="string"),
+                                    "ok": _schema(type="boolean"),
+                                    "kind": _schema(type="string", enum=["text"]),
+                                    "watermarked_text": _schema(type="string"),
+                                    "report": _schema(type="object"),
+                                    "error": _schema(type="string"),
+                                },
+                            ),
+                        ),
+                    },
+                )
+            },
+        }
+    },
 }
 
-_ERROR_SCHEMA = _schema(
-    type="object",
-    properties={"ok": _schema(type="boolean", enum=[False]), "error": _schema(type="string")},
-)
 _COMMON_ERRORS = {
     "400": {
         "description": "Bad request",
@@ -640,6 +825,9 @@ def openapi_spec() -> dict[str, Any]:
         for method, op in ops.items():
             responses = dict(_COMMON_ERRORS)
             for status, body in op["responses"].items():
+                if "description" in body and "content" in body:
+                    responses[status] = body
+                    continue
                 responses[status] = {
                     "description": "Success",
                     "content": {"application/json": {"schema": body}},
@@ -729,7 +917,103 @@ def _parse_clean_options(options: Any) -> dict[str, Any]:
     deep_images = options.get("deep_images")
     if deep_images is not None and deep_images not in DEEP_IMAGE_MODES:
         raise ValueError(f"option 'deep_images' must be one of {sorted(DEEP_IMAGE_MODES)}")
+    # A per-request strategy overrides the default; validate it up front so a bad
+    # tactic/intensity is a 400 rather than a mid-clean failure.
+    if "strategy" in options:
+        from rewrite_text import parse_strategy
+
+        parse_strategy(options["strategy"])
     return options
+
+
+def _load_default_strategy(config_path: Path) -> str | None:
+    """Read the default Layer B strategy from the config file.
+
+    Returns None when the config file is absent (no Layer B on text). A file that
+    is present but malformed (bad JSON, unknown tactic, bad intensity) is a
+    startup error, since the config is explicit in-repo.
+    """
+    try:
+        data = json.loads(config_path.read_text())
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"invalid strategy config {config_path}: {e}") from e
+    spec = data.get("default_strategy")
+    if spec is None:
+        return None
+    from rewrite_text import parse_strategy
+
+    parse_strategy(spec)  # raises ValueError on a bad strategy
+    return spec
+
+
+def _apply_layer_b(text: str, strategy: str, options: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Apply a Layer B rewrite strategy to *text*, rejecting if unavailable.
+
+    Raises ValueError for an unconfigured/unavailable backend or model so the
+    caller surfaces a 400 rather than a 500. Wraps runtime failures the same way.
+    """
+    from rewrite_text import LLM_TACTICS, apply_strategy, parse_strategy
+
+    steps = parse_strategy(strategy)
+    needs_llm = any(t in LLM_TACTICS for t, _ in steps)
+    backend = os.environ.get("WATERMARKS_REWRITE_BACKEND", "print-prompt")
+    if needs_llm:
+        if backend not in ("openai-compatible", "ollama"):
+            raise ValueError(
+                "Layer B strategy needs an LLM rewrite backend (WATERMARKS_REWRITE_BACKEND)"
+            )
+        needs_key = backend == "openai-compatible"
+        missing = not os.environ.get("WATERMARKS_REWRITE_MODEL") or not os.environ.get(
+            "WATERMARKS_REWRITE_BASE_URL"
+        )
+        if needs_key:
+            missing = missing or not os.environ.get("WATERMARKS_REWRITE_API_KEY")
+        if missing:
+            required = "WATERMARKS_REWRITE_MODEL/BASE_URL"
+            if needs_key:
+                required += "/API_KEY"
+            raise ValueError(f"Layer B strategy needs the rewrite backend configured ({required})")
+    if any(t == "mlm" for t, _ in steps):
+        import importlib.util
+
+        if importlib.util.find_spec("transformers") is None:
+            raise ValueError("Layer B 'mlm' step requires transformers")
+    base_url = os.environ.get("WATERMARKS_REWRITE_BASE_URL")
+    if needs_llm and base_url:
+        host = urlparse(base_url).hostname or ""
+        allow_remote = os.environ.get("WATERMARKS_REWRITE_ALLOW_REMOTE", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if host not in ("127.0.0.1", "localhost", "::1") and not allow_remote:
+            raise ValueError(
+                "Layer B strategy uses a remote rewrite endpoint; set "
+                "WATERMARKS_REWRITE_ALLOW_REMOTE=1"
+            )
+    try:
+        out, stats = apply_strategy(
+            text,
+            steps,
+            backend=backend,
+            model=os.environ.get("WATERMARKS_REWRITE_MODEL"),
+            base_url=os.environ.get("WATERMARKS_REWRITE_BASE_URL"),
+            api_key=os.environ.get("WATERMARKS_REWRITE_API_KEY"),
+            temperature=float(os.environ.get("WATERMARKS_REWRITE_TEMPERATURE", "0.9")),
+            reasoning_effort=(
+                None
+                if os.environ.get("WATERMARKS_REWRITE_REASONING_EFFORT") == "off"
+                else os.environ.get("WATERMARKS_REWRITE_REASONING_EFFORT") or None
+            ),
+            style=options.get("style"),
+            layer_a_after=bool(options.get("also_layer_a_text")),
+        )
+    except (RuntimeError, TimeoutError, urllib.error.URLError) as e:
+        raise ValueError(f"Layer B rewrite failed: {e}") from e
+    return out, stats
 
 
 def _batch_items(
@@ -946,10 +1230,22 @@ def _clean_payload(data: bytes, name: str, options: dict[str, Any]) -> dict[str,
                 aggressive_homoglyphs=bool(options.get("aggressive_homoglyphs")),
                 normalize_spaces=bool(options.get("normalize_spaces", True)),
             )
+            # Layer B is a required step for text cleaning: always apply the
+            # default (or per-request) rewrite strategy and reject (400) when no
+            # strategy is available or a step's backend/model can't run.
+            strategy = options.get("strategy") or _DEFAULT_STRATEGY
+            if not strategy:
+                raise ValueError(
+                    "Layer B rewrite is required for text cleaning; configure a "
+                    "default strategy (config/clean_strategy.json) or pass "
+                    "options.strategy"
+                )
+            cleaned, layer_b = _apply_layer_b(cleaned, strategy, options)
             if detect_after:
                 detector_reports["after"] = run_text_detectors(cleaned)
             cleaned_bytes = cleaned.encode("utf-8", errors="surrogateescape")
             report: dict[str, Any] = {"kind": "text", "stats": stats, "length": len(cleaned)}
+            report["layer_b"] = layer_b
             if detector_reports:
                 report["text_detectors"] = detector_reports
         elif kind == "image":
@@ -1152,9 +1448,11 @@ class Handler(BaseHTTPRequestHandler):
             "/inspect",
             "/clean",
             "/detect",
+            "/watermark",
             "/inspect/batch",
             "/detect/batch",
             "/clean/batch",
+            "/watermark/batch",
         ):
             self._respond(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
             return
@@ -1174,6 +1472,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_detect_batch(body)
             elif path == "/clean/batch":
                 self._handle_clean_batch(body)
+            elif path == "/watermark/batch":
+                self._handle_watermark_batch(body)
+            elif path == "/watermark":
+                self._handle_watermark(body)
             else:
                 data, name = _decode_input(body)
                 if path == "/inspect":
@@ -1247,6 +1549,98 @@ class Handler(BaseHTTPRequestHandler):
             results.append({"name": name, **payload})
         self._respond(HTTPStatus.OK, {"ok": True, "results": results})
 
+    def _extract_text_input(self, body: dict[str, Any]) -> tuple[str, str]:
+        """Extract raw text and optional name from a watermark request body."""
+        name = body.get("name") if isinstance(body.get("name"), str) else ""
+        if "text" in body:
+            raw_text = body["text"]
+            if not isinstance(raw_text, str) or not raw_text.strip():
+                raise ValueError("'text' must be a non-empty string")
+            return raw_text, name
+        if "file" in body:
+            data, decoded_name = _decode_input(body)
+            if looks_binary(data):
+                raise ValueError("refusing to treat binary content as text for watermarking")
+            return data.decode("utf-8", errors="surrogateescape"), name or decoded_name
+        raise ValueError("request must include 'text' or base64 'file'")
+
+    def _handle_watermark(self, body: dict[str, Any]) -> None:
+        text, _name = self._extract_text_input(body)
+        keys = body.get("keys")
+        options = parse_watermark_options(body.get("options"))
+        timeout = resolve_timeout(None)
+        res = generate_watermark_text(text, keys=keys, options=options, timeout=timeout)
+        if res.get("ok"):
+            self._respond(HTTPStatus.OK, res)
+        else:
+            self._respond(_watermark_error_status(res), res)
+
+    def _handle_watermark_batch(self, body: dict[str, Any]) -> None:
+        files = body.get("files")
+        if not isinstance(files, list):
+            raise ValueError("missing array field 'files'")
+        if not files:
+            raise ValueError("'files' must not be empty")
+        if len(files) > MAX_BATCH_FILES:
+            raise ValueError(f"'files' exceeds the {MAX_BATCH_FILES}-file batch limit")
+
+        backend_configured = bool(
+            os.environ.get("WATERMARKS_SYNTHID_TEXT_URL", "").strip()
+            or os.environ.get("MARKLLM_DIR", "").strip()
+        )
+        if not backend_configured:
+            self._respond(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {
+                    "ok": False,
+                    "error": (
+                        "no text watermark generator configured (set WATERMARKS_SYNTHID_TEXT_URL "
+                        "for the sidecar or MARKLLM_DIR for local execution)"
+                    ),
+                },
+            )
+            return
+
+        batch_budget = resolve_timeout(None)
+        deadline = time.monotonic() + batch_budget
+
+        results = []
+        timed_out = False
+        for entry in files:
+            if not isinstance(entry, dict):
+                results.append(
+                    {"name": "", "ok": False, "error": "each entry in 'files' must be an object"}
+                )
+                continue
+            name = entry.get("name") if isinstance(entry.get("name"), str) else ""
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or timed_out:
+                timed_out = True
+                results.append({"name": name, "ok": False, "error": "batch deadline exceeded"})
+                continue
+
+            try:
+                text, extracted_name = self._extract_text_input(entry)
+                entry_name = name or extracted_name
+                keys = entry.get("keys")
+                options = parse_watermark_options(entry.get("options"))
+                res = generate_watermark_text(text, keys=keys, options=options, timeout=remaining)
+                if res.get("ok"):
+                    results.append({"name": entry_name, **res})
+                else:
+                    err = res.get("error", "watermark generation failed")
+                    if res.get("error_code") == "timeout":
+                        timed_out = True
+                    results.append({"name": entry_name, "ok": False, "error": err})
+            except ValueError as e:
+                results.append({"name": name, "ok": False, "error": str(e)})
+            except Exception as e:
+                self.log_error("watermark batch entry error for %r: %r", name, e)
+                results.append({"name": name, "ok": False, "error": "internal error"})
+
+        self._respond(HTTPStatus.OK, {"ok": True, "results": results})
+
 
 def main() -> int:
     global API_KEY  # noqa: PLW0603 — CLI overrides env
@@ -1256,6 +1650,13 @@ def main() -> int:
         "--port", type=int, default=int(os.environ.get("WATERMARKS_SERVER_PORT", "8765"))
     )
     p.add_argument("--api-key", default=API_KEY, help="require this bearer token (default: none)")
+    p.add_argument(
+        "--strategy-config",
+        default=os.environ.get("WATERMARKS_CLEAN_STRATEGY_FILE", "config/clean_strategy.json"),
+        help="Path to the Layer B strategy config JSON (default: "
+        "config/clean_strategy.json; WATERMARKS_CLEAN_STRATEGY_FILE). A strategy "
+        "step is 'tactic@intensity' (e.g. 'paraphrase@0.8,mlm@0.2').",
+    )
     p.add_argument("-V", "--version", action="store_true", help="print version and exit")
     args = p.parse_args()
 
@@ -1264,6 +1665,8 @@ def main() -> int:
         return 0
 
     API_KEY = args.api_key
+    global _DEFAULT_STRATEGY  # noqa: PLW0603 — loaded once at startup
+    _DEFAULT_STRATEGY = _load_default_strategy(Path(args.strategy_config))
 
     if args.host not in ("127.0.0.1", "localhost", "::1"):
         eprint(f"warning: binding {args.host} — intended for a trusted network only")
