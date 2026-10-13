@@ -67,14 +67,34 @@ function pythonBin(): string {
   return process.env.WATERMARKS_REMOVER_PYTHON || "python3";
 }
 
+/**
+ * Run audit_dir.py and parse its JSON report.
+ *
+ * @postcondition Returns the parsed report for exit 0 (clean), 1 (actionable
+ *   findings) and 3 (partial scan) -- audit_dir.py prints the full JSON on
+ *   stdout in all three. Exit 1 is the normal "found something to clean" result,
+ *   not a failure, so execFileSync's throw-on-nonzero must not be treated as one.
+ * @throws for any other exit (e.g. 2 = usage/refusal, no JSON emitted) or a
+ *   spawn failure.
+ */
 function runAudit(scriptsDir: string, target: string, stylometry: boolean): AuditReport {
   const args = [join(scriptsDir, "audit_dir.py"), target, "--json"];
   if (stylometry) args.push("--check-stylometry");
-  const out = execFileSync(pythonBin(), args, {
-    encoding: "utf8",
-    maxBuffer: 64 * 1024 * 1024,
-  });
-  return JSON.parse(out) as AuditReport;
+  // Exit codes on which audit_dir.py still prints the full JSON report.
+  const AUDIT_REPORT_EXIT_CODES: Record<number, true> = { 0: true, 1: true, 3: true };
+  try {
+    const out = execFileSync(pythonBin(), args, {
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    return JSON.parse(out) as AuditReport;
+  } catch (err) {
+    const e = err as { status?: number | null; stdout?: string };
+    if (typeof e.status === "number" && AUDIT_REPORT_EXIT_CODES[e.status] && e.stdout) {
+      return JSON.parse(e.stdout) as AuditReport;
+    }
+    throw err;
+  }
 }
 
 function runClean(scriptsDir: string, filePath: string): CleanResult {
