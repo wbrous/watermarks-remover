@@ -1970,6 +1970,27 @@ _ODT_GENERATOR_CLOSE_RE = re.compile(r"</meta:generator\s*>", re.I)
 _DC_CREATOR_OPEN_RE = re.compile(r"<dc:creator\b[^>]*>", re.I)
 _DC_CREATOR_CLOSE_RE = re.compile(r"</dc:creator\s*>", re.I)
 
+# ODT meta.xml elements that carry free-form provenance text beyond the
+# generator/creator pair: Dublin Core description/subject plus ODF's own
+# initial-creator, keyword, and user-defined fields. Each is optional in
+# office:meta, so dropping one that names an AI vendor leaves valid ODF.
+# The inspector (inspect_odt) already flags a vendor name anywhere in
+# meta.xml; cleaning must cover the same elements or clean never converges.
+_ODT_META_TEXT_TAGS = (
+    "dc:description",
+    "dc:subject",
+    "meta:initial-creator",
+    "meta:keyword",
+    "meta:user-defined",
+)
+_ODT_META_TEXT_BLOCKS = tuple(
+    (
+        re.compile(rf"<{re.escape(tag)}\b[^>]*>", re.I),
+        re.compile(rf"</{re.escape(tag)}\s*>", re.I),
+    )
+    for tag in _ODT_META_TEXT_TAGS
+)
+
 DOCX_META_PARTS = (
     "docProps/core.xml",
     "docProps/app.xml",
@@ -2754,6 +2775,14 @@ def clean_odt(
                 if n:
                     actions.extend(["scrub creator-like meta"] * n)
                     text = new
+
+                # Same rule for the other free-form meta fields, so cleaning
+                # reaches everything inspect_odt flags.
+                for open_re, close_re in _ODT_META_TEXT_BLOCKS:
+                    new, n = _drop_blocks_if(text, open_re, close_re, _is_ai_creator)
+                    if n:
+                        actions.extend(["scrub descriptive meta"] * n)
+                        text = new
                 raw = text.encode("utf-8")
             else:
                 c2, ai, _ = _blob_hits(raw)
